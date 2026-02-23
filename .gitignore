@@ -1,0 +1,14 @@
+# Foundry build artifacts
+cache/
+out/
+
+# Environment
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
