@@ -206,9 +206,48 @@ contract StealthPayVaultTest is Test {
         vault.claim(req, sig, proof1, root);
     }
 
-    /// @notice 原生 ETH 发薪流程（占位）
+    /// @notice 原生 ETH 完整发薪流程：depositForPayroll{value} → claim → ETH 余额精准到账
     function test_NativeETH_Flow() public {
-        // TODO
+        uint256 stealthPk      = 0xA11CE;
+        address stealthAddress = vm.addr(stealthPk);
+        address recipient      = makeAddr("ethRecipient");
+
+        uint256 amount = 1 ether;
+        uint256 fee    = 0.01 ether;
+
+        // 单叶 Merkle，token = address(0) 代表原生 ETH
+        bytes32 leaf           = _leaf(stealthAddress, address(0), amount);
+        bytes32 root           = leaf;
+        bytes32[] memory proof = new bytes32[](0);
+
+        // HR：vm.deal 补充 ETH，然后 depositForPayroll{value: amount}
+        vm.deal(owner, amount);
+        vm.prank(owner);
+        vault.depositForPayroll{value: amount}(root, address(0), amount);
+
+        assertEq(address(vault).balance, amount, "vault should hold ETH");
+        assertTrue(vault.activeRoots(root), "root should be active");
+
+        // 员工：构造 ETH ClaimRequest 并签名
+        StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddress,
+            token:          address(0),   // 原生 ETH
+            amount:         amount,
+            recipient:      recipient,
+            feeAmount:      fee,
+            deadline:       block.timestamp + 1 hours
+        });
+        bytes memory sig = _signClaimRequest(req, stealthPk);
+
+        // Relayer 代发 claim
+        vm.prank(relayer);
+        vault.claim(req, sig, proof, root);
+
+        // 断言：ETH 精准到账
+        assertEq(address(recipient).balance, amount - fee, "recipient should receive amount-fee ETH");
+        assertEq(address(relayer).balance,   fee,          "relayer should receive fee ETH");
+        assertEq(address(vault).balance,     0,            "vault should be empty after claim");
+        assertTrue(vault.isClaimed(stealthAddress),        "isClaimed should be true");
     }
 
     // -----------------------------------------------------------------------
@@ -361,9 +400,57 @@ contract StealthPayVaultTest is Test {
         vault.claim(req, sig, emptyProof, root);
     }
 
-    /// @notice 防签名延展性（占位）
+    /// @notice high-s 签名被 OZ ECDSA 库拦截（ECDSAInvalidSignatureS）
     function test_RevertIf_SignatureMalleability() public {
-        // TODO
+        uint256 stealthPk      = 0xA11CE;
+        address stealthAddress = vm.addr(stealthPk);
+
+        uint256 amount         = 500 ether;
+        bytes32 leaf           = _leaf(stealthAddress, address(usdt), amount);
+        bytes32 root           = leaf;
+        bytes32[] memory proof = new bytes32[](0);
+
+        _depositUSDT(root, amount);
+
+        StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddress,
+            token:          address(usdt),
+            amount:         amount,
+            recipient:      employee,
+            feeAmount:      0,
+            deadline:       block.timestamp + 1 hours
+        });
+
+        // 在块作用域内构造 high-s 签名，避免 stack too deep
+        bytes memory malleatedSig;
+        {
+            bytes32 structHash = keccak256(abi.encode(
+                vault.CLAIM_TYPEHASH(),
+                req.stealthAddress,
+                req.token,
+                req.amount,
+                req.recipient,
+                req.feeAmount,
+                req.deadline
+            ));
+            bytes32 digest = keccak256(abi.encodePacked(
+                "\x19\x01",
+                vault.DOMAIN_SEPARATOR(),
+                structHash
+            ));
+            (uint8 v, bytes32 r, bytes32 s) = vm.sign(stealthPk, digest);
+
+            // high-s 变体：s2 = N - s（必然 > N/2），v 翻转
+            uint256 N  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
+            bytes32 s2 = bytes32(N - uint256(s));
+            uint8   v2 = v == 27 ? 28 : 27;
+            malleatedSig = abi.encodePacked(r, s2, v2);
+        }
+
+        // OZ ECDSA.recover 遇到 high-s 会 revert(ECDSAInvalidSignatureS)
+        vm.prank(relayer);
+        vm.expectRevert();
+        vault.claim(req, malleatedSig, proof, root);
     }
 
     // -----------------------------------------------------------------------
