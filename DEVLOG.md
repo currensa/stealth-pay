@@ -502,12 +502,129 @@ Ran 11 tests for test/StealthPayVault.t.sol:StealthPayVaultTest
 
 ---
 
-## 待完善（TODO）
+## 阶段 11：合约完善（ETH 流程 + 签名延展性 + NatSpec）
 
-| 项目 | 说明 |
-|------|------|
-| `test_NativeETH_Flow` | ETH 完整提款流程专项测试 |
-| `test_RevertIf_SignatureMalleability` | 构造 high-s 签名，验证 OZ ECDSA 拦截 |
-| E2E 集成测试更新 | `sdk/test/e2e.integration.test.ts` 需迁移到 Merkle 接口 |
-| 部署脚本 | Foundry `script/Deploy.s.sol` |
-| Natspec 完善 | 所有 public 接口补全文档注释 |
+### 目标
+清除阶段 10 遗留的 TODO 测试，完成合约文档注释。
+
+### `test_NativeETH_Flow`
+原生 ETH 完整流程：`depositForPayroll{value}` → 单叶树 → `claim` → 断言 ETH 余额精准到账。
+关键点：`token = address(0)` 走 `call{value}` 分支；`vm.deal(owner, amount)` 补充测试 ETH。
+
+### `test_RevertIf_SignatureMalleability`
+构造 high-s 签名：`s2 = N - s`，`v2 = flip(v)`（secp256k1 曲线阶 N 已知常量）。
+OZ `ECDSA.recover` 内部检查 `s <= N/2`，遇到 high-s 直接 revert `ECDSAInvalidSignatureS`。
+测试用 `vm.expectRevert()` 宽松匹配，避免依赖 OZ 内部错误字符串。
+
+### NatSpec
+为所有 `public`/`external` 接口、状态变量、事件、自定义错误补全 `@notice`/`@dev`/`@param`/`@return`。
+
+### 验证 GREEN
+
+```
+Ran 11 tests for test/StealthPayVault.t.sol:StealthPayVaultTest
+[PASS] testFuzz_AllocationAndClaim(uint256,uint256) (runs: 256)
+[PASS] test_ClaimWithValidSignature()
+[PASS] test_DepositForPayroll()
+[PASS] test_GasCost_Claim()               gas: ~192,036
+[PASS] test_NativeETH_Flow()              ✅ 新增
+[PASS] test_RevertIf_ExpiredDeadline()
+[PASS] test_RevertIf_InvalidMerkleProof()
+[PASS] test_RevertIf_InvalidRoot()
+[PASS] test_RevertIf_SignatureMalleability() ✅ 新增
+[PASS] test_RevertIf_TamperedPayload()
+[PASS] test_RevertIf_WrongSigner()
+11 passed; 0 failed
+```
+
+---
+
+## 阶段 12：E2E 迁移至 Merkle v2 + 部署脚本
+
+### E2E 迁移
+`sdk/test/e2e.integration.test.ts` 从旧 `batchAllocate` 接口完整迁移至 Merkle v2：
+
+**关键变更：**
+- 安装 `@openzeppelin/merkle-tree`，引入 `StandardMerkleTree`
+- `StandardMerkleTree.of([[stealthAddr, token, amount]], ["address","address","uint256"])` 构建单叶树
+- `tree.root` → `depositForPayroll`；`tree.getProof(0)` → `claim` 的第三参数
+- 移除 `nonce`，`ClaimRequest` 精简为 6 字段
+- `claim` 升级为 4 参数 `(req, sig, proof[], root)`
+
+**叶子格式兼容问题（关键 Bug）：**
+`StandardMerkleTree` 使用双重哈希：`keccak256(keccak256(abi.encode(...)))`，而原合约使用 `keccak256(abi.encodePacked(...))`——两者不兼容，E2E 必然抛 `InvalidMerkleProof`。
+
+**修复：** 同步更新合约与 Solidity 测试辅助函数 `_leaf()`：
+```solidity
+// 旧：keccak256(abi.encodePacked(stealth, token, amount))
+// 新：
+bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(stealth, token, amount))));
+```
+
+### 部署脚本 `script/Deploy.s.sol`
+`DeployScript` 继承 `Script`，`run()` 读取 `PRIVATE_KEY` 环境变量，依次部署 `ERC20Mock` 和 `StealthPayVault`，铸造初始 USDT，打印地址。
+
+### 验证 GREEN
+
+```
+forge test:  11/11 PASS
+vitest:       4/4 PASS（StealthKey × 3 + E2E × 1）
+forge build: Compiler run successful!
+```
+
+---
+
+## 阶段 13：Sepolia 测试网部署脚手架
+
+### 目标
+提供完整的测试网部署 + 全链路验证工具链，使任何人可在 Sepolia 上复现完整发薪流程。
+
+### 新增文件
+
+#### `src/mocks/ERC20Mock.sol`
+继承 OZ `ERC20`，添加无权限 `mint(address, uint256)` 函数（测试网专用）。
+
+#### `script/Deploy.s.sol`（更新）
+```solidity
+// 1. 部署 ERC20Mock("Tether USD", "USDT")
+// 2. 部署 StealthPayVault(deployer)
+// 3. usdt.mint(deployer, 1_000_000 * 10**18)
+// 4. console2.log 打印两个合约地址
+```
+
+#### `sdk/scripts/testnet-e2e.ts`
+Node.js/TypeScript 脚本，读取 `sdk/.env`（`PRIVATE_KEY` + `SEPOLIA_RPC_URL`），串联完整发薪闭环：
+
+```
+[本地] computeStealthAddress → StandardMerkleTree.of
+[链上] approve → depositForPayroll
+[本地] recoverStealthPrivateKey → signTypedData (EIP-712)
+[链上] claim(req, sig, proof, root)
+[输出] Sepolia Etherscan 链接
+```
+
+**运行：** `cd sdk && npm run run:testnet`（使用 `tsx` 直接执行 TypeScript）
+
+### 依赖
+- `dotenv` → 读取 `.env` 环境变量
+- `tsx`（devDependency）→ 无需编译直接运行 TypeScript
+- `viem/chains` `sepolia` → Sepolia 链配置（chainId = 11155111）
+
+### 验证
+
+```
+forge build: Compiler run successful!（5 个文件）
+```
+
+---
+
+## 最终状态总览
+
+| 层 | 文件 | 测试数 | 状态 |
+|----|------|--------|------|
+| 合约 | `src/StealthPayVault.sol` | 11（含 256 轮 fuzz） | ✅ 全绿 |
+| 合约 Mock | `src/mocks/ERC20Mock.sol` | — | ✅ 编译通过 |
+| 部署脚本 | `script/Deploy.s.sol` | — | ✅ 编译通过 |
+| SDK | `sdk/src/StealthKey.ts` | 3 | ✅ 全绿 |
+| 本地 E2E | `sdk/test/e2e.integration.test.ts` | 1 | ✅ 全绿（Anvil） |
+| 测试网脚本 | `sdk/scripts/testnet-e2e.ts` | — | ✅ 已就绪（Sepolia） |

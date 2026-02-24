@@ -1,6 +1,6 @@
 # StealthPay — 企业级隐私发薪系统
 
-> **版本：** v2.0 (Merkle Tree 架构) | **框架：** Foundry + TypeScript SDK | **网络：** EVM 兼容链
+> **版本：** v2.1 (Sepolia 就绪) | **框架：** Foundry + TypeScript SDK | **网络：** EVM 兼容链（已验证 Sepolia）
 
 在 Web3 企业和 DAO 的日常运营中，"链上发薪"存在严重的隐私泄露问题：通过区块链浏览器可以轻易推导出公司的**完整员工名单**和**内部薪资结构**。StealthPay 通过 ECDH 隐身地址 + Merkle Tree + EIP-712 中继提取的组合，在隐私保护、Gas 成本与用户体验之间取得平衡。
 
@@ -68,20 +68,26 @@ stealthAddress = keccak256(stealthPub[1:])[12:]  // 以太坊地址
 ```
 stealth-pay/
 ├── src/
-│   └── StealthPayVault.sol     # 核心合约（Merkle + EIP-712）
+│   ├── StealthPayVault.sol          # 核心合约（Merkle + EIP-712）
+│   └── mocks/
+│       └── ERC20Mock.sol            # 测试网用可铸造 ERC-20
 ├── test/
-│   └── StealthPayVault.t.sol   # Foundry 测试套件（11 个测试）
+│   └── StealthPayVault.t.sol        # Foundry 测试套件（11 个测试）
+├── script/
+│   └── Deploy.s.sol                 # Foundry 部署脚本（ERC20Mock + Vault）
 ├── sdk/
 │   ├── src/
-│   │   └── StealthKey.ts       # ECDH 影子密钥推导 SDK
+│   │   └── StealthKey.ts            # ECDH 影子密钥推导 SDK
+│   ├── scripts/
+│   │   └── testnet-e2e.ts           # Sepolia 全链路交互脚本
 │   └── test/
-│       ├── StealthKey.test.ts  # SDK 单元测试
+│       ├── StealthKey.test.ts       # SDK 单元测试
 │       └── e2e.integration.test.ts  # 全链路 E2E 测试（Anvil）
 ├── lib/
 │   ├── forge-std/
 │   └── openzeppelin-contracts/
 ├── foundry.toml
-└── DEVLOG.md                   # 完整开发日志（10 个阶段）
+└── DEVLOG.md                        # 完整开发日志（13 个阶段）
 ```
 
 ---
@@ -130,7 +136,8 @@ function claim(
 ### Merkle 叶子格式
 
 ```solidity
-bytes32 leaf = keccak256(abi.encodePacked(stealthAddress, token, amount));
+// 双重哈希，与 @openzeppelin/merkle-tree StandardMerkleTree 兼容
+bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(stealthAddress, token, amount))));
 ```
 
 ### 自定义错误
@@ -216,9 +223,28 @@ npm test
 ### 本地 E2E
 
 ```bash
-# 需要 Anvil 在后台运行（或由测试自动启动）
+# Anvil 由测试自动启动
 cd sdk
 npm test test/e2e.integration.test.ts
+```
+
+### Sepolia 测试网 E2E
+
+```bash
+# 1. 部署合约（记录输出的两个地址）
+PRIVATE_KEY=0x... forge script script/Deploy.s.sol \
+  --rpc-url $SEPOLIA_RPC_URL --broadcast --verify \
+  --etherscan-api-key $ETHERSCAN_KEY
+
+# 2. 在 sdk/scripts/testnet-e2e.ts 中填入部署后的合约地址
+#    VAULT_ADDRESS = '0x...'
+#    USDT_ADDRESS  = '0x...'
+
+# 3. 创建 sdk/.env
+echo "PRIVATE_KEY=0x...\nSEPOLIA_RPC_URL=https://..." > sdk/.env
+
+# 4. 运行全链路脚本
+cd sdk && npm run run:testnet
 ```
 
 ---
@@ -236,6 +262,8 @@ npm test test/e2e.integration.test.ts
 | `test_RevertIf_WrongSigner` | 安全边界 | 篡改 feeAmount → EIP-712 签名不匹配 |
 | `test_RevertIf_InvalidRoot` | 安全边界 | 未注册 root → `InvalidRoot()` |
 | `test_RevertIf_InvalidMerkleProof` | 安全边界 | 错误 proof → `InvalidMerkleProof()` |
+| `test_NativeETH_Flow` | 正常流程 | ETH 完整发薪+提款，vault 余额清零 |
+| `test_RevertIf_SignatureMalleability` | 安全边界 | high-s 签名被 OZ ECDSA 拦截 |
 | `testFuzz_AllocationAndClaim` | 模糊测试 | 256 轮随机金额，单叶退化树（root=leaf） |
 | `test_GasCost_Claim` | Gas 基准 | Merkle claim gas: ~192,036 |
 
@@ -246,7 +274,16 @@ npm test test/e2e.integration.test.ts
 | ECDH 主链路 | 影子私钥 ↔ 影子地址完全吻合 |
 | 一次性特性 | 不同 ephemeral key → 不同影子地址 |
 | 格式断言 | `getMetaPublicKey` 输出 `0x04[128 hex]` |
-| E2E 全链路 | Anvil 上全流程验证（185ms） |
+| E2E 全链路 | Anvil 上全流程验证，StandardMerkleTree + Merkle v2 接口 |
+
+### Sepolia 全链路脚本
+
+`sdk/scripts/testnet-e2e.ts` 在真实测试网上跑通完整发薪流程：
+- 读取 `.env` 中的 `PRIVATE_KEY` + `SEPOLIA_RPC_URL`
+- 调用 `computeStealthAddress` 生成影子地址
+- `StandardMerkleTree.of` 构建 Merkle 树
+- `depositForPayroll` → EIP-712 签名 → `claim`
+- 打印 Sepolia Etherscan 链接
 
 ---
 
@@ -270,22 +307,32 @@ deadline → isClaimed → feeAmount ≤ amount → activeRoots[root]
 
 ## 九、部署
 
-```bash
-# 本地 Anvil 测试部署
-PRIVATE_KEY=0xac0974... forge script script/Deploy.s.sol \
-  --rpc-url http://127.0.0.1:8545 \
-  --broadcast
+`script/Deploy.s.sol` 一次性部署 **ERC20Mock（测试网用）** 和 **StealthPayVault**，并向 deployer 铸造 1,000,000 USDT。
 
-# 主网 / 测试网部署
+```bash
+# 本地 Anvil
+PRIVATE_KEY=0xac0974... forge script script/Deploy.s.sol \
+  --rpc-url http://127.0.0.1:8545 --broadcast
+
+# Sepolia 测试网（附合约验证）
 PRIVATE_KEY=$YOUR_KEY forge script script/Deploy.s.sol \
-  --rpc-url $RPC_URL \
-  --broadcast \
-  --verify \
+  --rpc-url $SEPOLIA_RPC_URL \
+  --broadcast --verify \
   --etherscan-api-key $ETHERSCAN_KEY
 ```
 
-`PRIVATE_KEY` 持有者将自动成为合约 Owner（即企业多签地址）。
+部署后控制台输出：
+
+```
+=== Deployment Complete ===
+ERC20Mock (USDT) : 0x...
+StealthPayVault  : 0x...
+Deployer (Owner) : 0x...
+Minted 1,000,000 USDT to deployer.
+```
+
+`PRIVATE_KEY` 持有者自动成为合约 Owner（生产环境建议替换为企业多签地址）。
 
 ---
 
-> 完整开发过程（10 个 TDD 阶段）详见 [DEVLOG.md](./DEVLOG.md)。
+> 完整开发过程（13 个阶段）详见 [DEVLOG.md](./DEVLOG.md)。
