@@ -433,11 +433,81 @@ Test Files  2 passed (2)
 
 ---
 
+## 阶段 10：Merkle Tree 架构重构（隐藏员工总数与薪资结构）
+
+### 动机
+原有 `batchAllocate` 方案将所有影子地址与金额明文写入 calldata，链上可推断企业发薪规模。改用 Merkle Tree：HR 只提交一个 32 字节的树根，链上信息仅为"本期共发放 X 代币"，员工按需提供自己的 Merkle Proof 提款。
+
+### 架构变更对比
+
+| 方面 | 旧方案 | 新方案（Merkle） |
+|------|--------|----------------|
+| 资金分配 | `batchAllocate(addrs[], tokens[], amounts[])` | `depositForPayroll(merkleRoot, token, total)` |
+| 隐私性 | calldata 含所有地址与金额 | 只有 root（32 字节），叶子数据链下保管 |
+| 防重放 | `nonces[stealthAddr]++` | `isClaimed[stealthAddr] = true` |
+| claim 签名 | ClaimRequest 含 `nonce` | ClaimRequest 无 `nonce`（一次性 isClaimed 足够） |
+| claim 参数 | `claim(req, sig)` | `claim(req, sig, merkleProof[], root)` |
+| 状态变量 | `balances[token][stealth]` | `activeRoots[root]` + `isClaimed[stealth]` |
+
+### Merkle 树结构
+
+```
+叶子：leaf = keccak256(abi.encodePacked(stealthAddress, token, amount))
+
+2-叶示例（OZ 排序）：
+  leaf1 = keccak256(stealthAddr1, usdt, 1000e18)
+  leaf2 = keccak256(stealthAddr2, usdt, 2000e18)
+  root  = keccak256(min(leaf1,leaf2) ++ max(leaf1,leaf2))
+
+  leaf1 的 proof = [leaf2]，leaf2 的 proof = [leaf1]
+
+单叶退化树（fuzz 测试用）：
+  root = leaf，proof = []（OZ processProof 空 proof 时返回 leaf 本身）
+```
+
+### claim 检查顺序
+
+```
+deadline → isClaimed → feeAmount ≤ amount → activeRoots[root] → MerkleProof.verify → ECDSA.recover → isClaimed=true → 转账
+```
+
+### TDD 流程
+
+#### RED
+失败原因：`Member "depositForPayroll" not found or not visible`（测试使用新接口，合约还是旧接口）
+
+新增测试：`test_DepositForPayroll`、`test_RevertIf_InvalidRoot`、`test_RevertIf_InvalidMerkleProof`
+
+更新测试：`test_ClaimWithValidSignature`（含 AlreadyClaimed 验证）、`test_RevertIf_TamperedPayload`（篡改 amount 现在触发 `InvalidMerkleProof`）
+
+移除测试：`test_BatchAllocate`、`test_GasCost_BatchAllocate_100`
+
+#### 验证 GREEN
+
+```
+Ran 11 tests for test/StealthPayVault.t.sol:StealthPayVaultTest
+[PASS] testFuzz_AllocationAndClaim(uint256,uint256) (runs: 256)
+[PASS] test_ClaimWithValidSignature()
+[PASS] test_DepositForPayroll()
+[PASS] test_GasCost_Claim()                     gas: 192036
+[PASS] test_NativeETH_Flow()                    (TODO)
+[PASS] test_RevertIf_ExpiredDeadline()
+[PASS] test_RevertIf_InvalidMerkleProof()
+[PASS] test_RevertIf_InvalidRoot()
+[PASS] test_RevertIf_SignatureMalleability()    (TODO)
+[PASS] test_RevertIf_TamperedPayload()
+[PASS] test_RevertIf_WrongSigner()
+11 passed; 0 failed
+```
+
+---
+
 ## 待完善（TODO）
 
 | 项目 | 说明 |
 |------|------|
 | `test_NativeETH_Flow` | ETH 完整提款流程专项测试 |
 | `test_RevertIf_SignatureMalleability` | 构造 high-s 签名，验证 OZ ECDSA 拦截 |
+| E2E 集成测试更新 | `sdk/test/e2e.integration.test.ts` 需迁移到 Merkle 接口 |
 | 部署脚本 | Foundry `script/Deploy.s.sol` |
 | Natspec 完善 | 所有 public 接口补全文档注释 |
