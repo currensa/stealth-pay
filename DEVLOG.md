@@ -364,6 +364,75 @@ Test Files  1 passed (1)
 
 ---
 
+## 阶段 9：E2E 全链路集成测试
+
+### 目标
+将 TypeScript SDK 与真实编译的 Solidity 合约结合，模拟"HR 发薪 → 员工签名 → Relayer 代发"完整闭环，在本地 Anvil 节点上端到端验证。
+
+### 技术选型
+| 技术 | 用途 |
+|------|------|
+| `viem` | 合约部署、交易发送、EIP-712 签名 |
+| `viem/chains` `foundry` | chainId = 31337（与 Anvil 对齐） |
+| Anvil (子进程) | 本地 EVM 节点，提供有余额的测试账户 |
+| `out/*.json` | 真实 forge 编译产物（ABI + Bytecode） |
+
+### TDD 流程
+
+#### RED
+首次失败原因：
+```
+Error: Anvil 启动超时
+```
+根因：`spawn('anvil', ['--silent'])` 使 Anvil 不输出 `"Listening on"` 日志，Promise 永远无法 resolve。
+
+**修复：** 去掉 `--silent`，同时监听 `stdout` + `stderr`（Anvil 各版本输出渠道不同）。
+
+#### GREEN（全链路流程）
+
+```typescript
+// [角色 1] HR
+const metaPubKey = getMetaPublicKey(META_PRIV);
+const { stealthAddress } = computeStealthAddress(metaPubKey, ephemeralPriv);
+await walletClient.writeContract({ functionName: 'mint', ... });
+await walletClient.writeContract({ functionName: 'approve', ... });
+await walletClient.writeContract({ functionName: 'batchAllocate', ... });
+
+// [角色 2] Employee
+const stealthPriv = recoverStealthPrivateKey(META_PRIV, ephemeralPub);
+const signature = await walletClient.signTypedData({
+  domain: { name: 'StealthPay', version: '1', chainId: 31337, verifyingContract: vaultAddress },
+  types: { ClaimRequest: [...] },
+  message: { stealthAddress, token, amount: 5000e6, feeAmount: 50e6, ... },
+});
+
+// [角色 3] Relayer
+await walletClient.writeContract({ functionName: 'claim', args: [claimReq, signature] });
+
+// 断言
+expect(recipientBalance).toBe(4_950_000_000n); // 4950 USDT
+expect(relayerBalance).toBe(50_000_000n);       //   50 USDT
+```
+
+#### 验证 GREEN
+
+```
+✓ test/e2e.integration.test.ts (1 test) 185ms
+✓ test/StealthKey.test.ts (3 tests) 53ms
+
+Test Files  2 passed (2)
+     Tests  4 passed (4)
+```
+
+### 关键决策
+
+- **EIP-712 domain 完全对齐**：`name = "StealthPay"`, `version = "1"`, `chainId = 31337`（foundry chain），`verifyingContract` = 部署后的合约地址——任何一项错误均会导致签名验证失败
+- **本地签名（LocalAccount）**：`privateKeyToAccount(stealthPriv)` 生成的账户无需连接节点即可签名，不需要 stealthAddress 有 ETH
+- **动态 nonce 读取**：`publicClient.readContract({ functionName: 'nonces', args: [stealthAddress] })` 确保 nonce 与链上状态一致
+- **Anvil 子进程生命周期**：`beforeAll` 启动（30s timeout），`afterAll` `kill()`，防止测试套件结束后端口占用
+
+---
+
 ## 待完善（TODO）
 
 | 项目 | 说明 |
