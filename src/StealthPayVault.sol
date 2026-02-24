@@ -4,12 +4,28 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 /// @title StealthPayVault
-/// @notice 企业级隐私资金分发与无感提取 — 合约骨架
-/// @dev 采用 EIP-712 签名验证，支持 ERC-20 与原生 ETH
+/// @notice 企业级隐私资金分发与无感提取
+/// @dev EIP-712 签名验证，支持 ERC-20 与原生 ETH
 contract StealthPayVault is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    // -------------------------------------------------------------------------
+    // 自定义错误（节省 string 存储与 ABI 编码开销）
+    // -------------------------------------------------------------------------
+
+    error ArrayLengthMismatch();
+    error EthAmountMismatch();
+    error SignatureExpired();
+    error InvalidNonce();
+    error FeeExceedsAmount();
+    error InvalidSignature();
+    error InsufficientBalance();
+    error EthTransferFailed();
+
     // -------------------------------------------------------------------------
     // 核心状态变量
     // -------------------------------------------------------------------------
@@ -24,7 +40,7 @@ contract StealthPayVault is Ownable, ReentrancyGuard {
     // EIP-712
     // -------------------------------------------------------------------------
 
-    bytes32 public constant CLAIM_REQUEST_TYPEHASH = keccak256(
+    bytes32 public constant CLAIM_TYPEHASH = keccak256(
         "ClaimRequest(address stealthAddress,address token,uint256 amount,address recipient,uint256 feeAmount,uint256 nonce,uint256 deadline)"
     );
 
@@ -60,7 +76,7 @@ contract StealthPayVault is Ownable, ReentrancyGuard {
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-                keccak256("StealthPayVault"),
+                keccak256("StealthPay"),
                 keccak256("1"),
                 block.chainid,
                 address(this)
@@ -73,60 +89,61 @@ contract StealthPayVault is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice 批量发薪：将资金分配给指定的影子地址列表（仅限 Owner）
-    /// @param stealthAddresses 影子地址数组
-    /// @param tokens           对应的代币地址数组（address(0) 为 ETH）
-    /// @param amounts          对应的分配金额数组
     function batchAllocate(
         address[] calldata stealthAddresses,
         address[] calldata tokens,
         uint256[] calldata amounts
     ) external payable onlyOwner {
-        require(
-            stealthAddresses.length == tokens.length && tokens.length == amounts.length,
-            "Length mismatch"
-        );
+        if (stealthAddresses.length != tokens.length || tokens.length != amounts.length) {
+            revert ArrayLengthMismatch();
+        }
 
         uint256 totalEth;
-        for (uint256 i = 0; i < stealthAddresses.length; i++) {
-            address token  = tokens[i];
-            uint256 amount = amounts[i];
+        uint256 len = stealthAddresses.length;
+
+        for (uint256 i = 0; i < len;) {
+            address token   = tokens[i];
+            uint256 amount  = amounts[i];
             address stealth = stealthAddresses[i];
 
             if (token == address(0)) {
                 totalEth += amount;
             } else {
-                IERC20(token).transferFrom(msg.sender, address(this), amount);
+                IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
             }
 
             balances[token][stealth] += amount;
             emit Allocated(token, stealth, amount);
+
+            unchecked { ++i; }
         }
 
-        require(msg.value == totalEth, "ETH amount mismatch");
+        if (msg.value != totalEth) revert EthAmountMismatch();
     }
 
     /// @notice 签名提款：由 Relayer 代发，Vault 验证 EIP-712 签名后向 recipient 转账
-    /// @param req       ClaimRequest 结构体
-    /// @param signature 影子私钥对 req 的 EIP-712 签名
     function claim(
         ClaimRequest calldata req,
         bytes calldata signature
     ) external nonReentrant {
+        // 缓存高频 storage key，减少重复 SLOAD
+        address stealth = req.stealthAddress;
+        address token   = req.token;
+
         // 1. 时效检查
-        require(block.timestamp <= req.deadline, "Signature expired");
+        if (block.timestamp > req.deadline) revert SignatureExpired();
 
         // 2. 防重放：nonce 必须匹配
-        require(req.nonce == nonces[req.stealthAddress], "Invalid nonce");
+        if (req.nonce != nonces[stealth]) revert InvalidNonce();
 
-        // 3. 余额与手续费合法性检查
-        require(balances[req.token][req.stealthAddress] >= req.amount, "Insufficient balance");
-        require(req.amount >= req.feeAmount, "Fee exceeds amount");
+        // 3. 手续费合法性（廉价检查，置于签名验证前）
+        if (req.amount < req.feeAmount) revert FeeExceedsAmount();
 
-        // 4. 重建 EIP-712 摘要
+        // 4. EIP-712 验签（先于余额检查，防余额信息泄露）
         bytes32 structHash = keccak256(abi.encode(
-            CLAIM_REQUEST_TYPEHASH,
-            req.stealthAddress,
-            req.token,
+            CLAIM_TYPEHASH,
+            stealth,
+            token,
             req.amount,
             req.recipient,
             req.feeAmount,
@@ -135,33 +152,35 @@ contract StealthPayVault is Ownable, ReentrancyGuard {
         ));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
 
-        // 5. 恢复签名者（ECDSA 自动防签名延展性攻击）
-        address signer = ECDSA.recover(digest, signature);
-        require(signer == req.stealthAddress, "Invalid signature");
+        if (ECDSA.recover(digest, signature) != stealth) revert InvalidSignature();
 
-        // 6. 先更新状态，后转账（防重入）
-        nonces[req.stealthAddress]++;
-        balances[req.token][req.stealthAddress] -= req.amount;
+        // 5. 余额检查（签名验证后）
+        uint256 bal = balances[token][stealth];
+        if (bal < req.amount) revert InsufficientBalance();
 
-        uint256 net = req.amount - req.feeAmount;
-
-        // 7. 转账
-        if (req.token == address(0)) {
-            // 原生 ETH
-            if (req.feeAmount > 0) {
-                (bool ok,) = msg.sender.call{value: req.feeAmount}("");
-                require(ok, "Fee ETH transfer failed");
-            }
-            (bool ok2,) = req.recipient.call{value: net}("");
-            require(ok2, "ETH transfer failed");
-        } else {
-            // ERC-20
-            if (req.feeAmount > 0) {
-                IERC20(req.token).transfer(msg.sender, req.feeAmount);
-            }
-            IERC20(req.token).transfer(req.recipient, net);
+        // 6. 状态更新（unchecked 安全：nonce 不会溢出，balance 已校验足够）
+        unchecked {
+            nonces[stealth]        = req.nonce + 1;
+            balances[token][stealth] = bal - req.amount;
         }
 
-        emit Claimed(req.token, req.stealthAddress, req.recipient, net);
+        uint256 fee = req.feeAmount;
+        uint256 net;
+        unchecked { net = req.amount - fee; }
+
+        // 7. 转账
+        if (token == address(0)) {
+            if (fee > 0) {
+                (bool ok,) = msg.sender.call{value: fee}("");
+                if (!ok) revert EthTransferFailed();
+            }
+            (bool ok2,) = req.recipient.call{value: net}("");
+            if (!ok2) revert EthTransferFailed();
+        } else {
+            if (fee > 0) IERC20(token).safeTransfer(msg.sender, fee);
+            IERC20(token).safeTransfer(req.recipient, net);
+        }
+
+        emit Claimed(token, stealth, req.recipient, net);
     }
 }

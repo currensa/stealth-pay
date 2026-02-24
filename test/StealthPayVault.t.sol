@@ -98,7 +98,7 @@ contract StealthPayVaultTest is Test {
         uint256 privateKey
     ) internal view returns (bytes memory) {
         bytes32 structHash = keccak256(abi.encode(
-            vault.CLAIM_REQUEST_TYPEHASH(),
+            vault.CLAIM_TYPEHASH(),
             req.stealthAddress,
             req.token,
             req.amount,
@@ -137,88 +137,106 @@ contract StealthPayVaultTest is Test {
 
     /// @notice 验证 batchAllocate 正确记账，且非 Owner 无法调用
     function test_BatchAllocate() public {
-        // 准备 3 个影子地址
-        address stealth1 = makeAddr("stealth1");
-        address stealth2 = makeAddr("stealth2");
-        address stealth3 = makeAddr("stealth3");
+        // ── Scenario 1: 数组长度不一致 → 必须 revert ArrayLengthMismatch() ──
+        {
+            address[] memory a = new address[](2);
+            address[] memory t = new address[](1); // 故意不一致
+            uint256[] memory m = new uint256[](2);
+            vm.prank(owner);
+            vm.expectRevert(abi.encodeWithSignature("ArrayLengthMismatch()"));
+            vault.batchAllocate(a, t, m);
+        }
 
-        uint256 amount1 = 1_000 * 1e6;  // 1000 USDT → stealth1
-        uint256 amount2 = 2_500 * 1e6;  // 2500 USDT → stealth2
-        uint256 amount3 = 0.5 ether;    // 0.5 ETH   → stealth3
+        // ── Scenario 2: 非 Owner 调用 → revert ──
+        {
+            address[] memory a = new address[](1);
+            address[] memory t = new address[](1);
+            uint256[] memory m = new uint256[](1);
+            vm.prank(relayer);
+            vm.expectRevert();
+            vault.batchAllocate(a, t, m);
+        }
 
-        address[] memory stealthAddrs = new address[](3);
-        stealthAddrs[0] = stealth1;
-        stealthAddrs[1] = stealth2;
-        stealthAddrs[2] = stealth3;
+        // ── Scenario 3 & 4: 混合批次：2 个 ETH 地址 + 2 个 USDT 地址 ──
+        address ethStealth1  = makeAddr("ethStealth1");
+        address ethStealth2  = makeAddr("ethStealth2");
+        address usdtStealth1 = makeAddr("usdtStealth1");
+        address usdtStealth2 = makeAddr("usdtStealth2");
 
-        address[] memory tokens = new address[](3);
-        tokens[0] = address(usdt);
-        tokens[1] = address(usdt);
-        tokens[2] = address(0); // 原生 ETH
+        uint256 ethAmt1  = 0.3 ether;
+        uint256 ethAmt2  = 0.7 ether;
+        uint256 usdtAmt1 = 1_000 * 1e6;
+        uint256 usdtAmt2 = 2_500 * 1e6;
 
-        uint256[] memory amounts = new uint256[](3);
-        amounts[0] = amount1;
-        amounts[1] = amount2;
-        amounts[2] = amount3;
+        address[] memory stealthAddrs = new address[](4);
+        stealthAddrs[0] = ethStealth1;
+        stealthAddrs[1] = ethStealth2;
+        stealthAddrs[2] = usdtStealth1;
+        stealthAddrs[3] = usdtStealth2;
 
-        // 给 owner 充值 ETH
-        vm.deal(owner, 1 ether);
+        address[] memory tokenArr = new address[](4);
+        tokenArr[0] = address(0);       // ETH
+        tokenArr[1] = address(0);       // ETH
+        tokenArr[2] = address(usdt);
+        tokenArr[3] = address(usdt);
 
-        // Owner 批准 Vault 拉取 USDT，并附带 ETH 调用
+        uint256[] memory amtArr = new uint256[](4);
+        amtArr[0] = ethAmt1;
+        amtArr[1] = ethAmt2;
+        amtArr[2] = usdtAmt1;
+        amtArr[3] = usdtAmt2;
+
+        vm.deal(owner, ethAmt1 + ethAmt2);
         vm.startPrank(owner);
-        usdt.approve(address(vault), amount1 + amount2);
-        vault.batchAllocate{value: amount3}(stealthAddrs, tokens, amounts);
+        usdt.approve(address(vault), usdtAmt1 + usdtAmt2);
+        vault.batchAllocate{value: ethAmt1 + ethAmt2}(stealthAddrs, tokenArr, amtArr);
         vm.stopPrank();
 
-        // 断言余额映射正确更新
-        assertEq(vault.balances(address(usdt), stealth1), amount1, "stealth1 USDT balance mismatch");
-        assertEq(vault.balances(address(usdt), stealth2), amount2, "stealth2 USDT balance mismatch");
-        assertEq(vault.balances(address(0),    stealth3), amount3, "stealth3 ETH balance mismatch");
+        // Scenario 3: 两个原生 ETH 影子地址余额准确
+        assertEq(vault.balances(address(0), ethStealth1),    ethAmt1,  "ethStealth1 balance mismatch");
+        assertEq(vault.balances(address(0), ethStealth2),    ethAmt2,  "ethStealth2 balance mismatch");
 
-        // 非 Owner 调用必须回滚
-        vm.prank(relayer);
-        vm.expectRevert();
-        vault.batchAllocate{value: 0}(stealthAddrs, tokens, amounts);
+        // Scenario 4: 两个 USDT 影子地址余额准确
+        assertEq(vault.balances(address(usdt), usdtStealth1), usdtAmt1, "usdtStealth1 balance mismatch");
+        assertEq(vault.balances(address(usdt), usdtStealth2), usdtAmt2, "usdtStealth2 balance mismatch");
     }
 
     /// @notice 完整 EIP-712 提款流程：余额变化完全准确
     function test_ClaimWithValidSignature() public {
-        uint256 salary  = 5_000 * 1e6; // 5000 USDT 总额
-        uint256 fee     = 10 * 1e6;    // 10 USDT 给 Relayer
+        // 使用规范指定的已知私钥推导影子地址
+        uint256 stealthPk      = 0xA11CE;
+        address stealthAddress = vm.addr(stealthPk);
 
-        // 1. 给影子地址分配 USDT
-        _allocateUSDT(stealthAddr, salary);
+        uint256 salary = 1_000 * 1e6; // 1000 USDT
+        uint256 fee    = 10   * 1e6;  // 10 USDT → Relayer
+        address recip  = makeAddr("recipient");
+
+        // 1. 给影子地址分配 1000 USDT
+        _allocateUSDT(stealthAddress, salary);
 
         // 2. 构造 ClaimRequest
         StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
-            stealthAddress: stealthAddr,
+            stealthAddress: stealthAddress,
             token:          address(usdt),
             amount:         salary,
-            recipient:      employee,
+            recipient:      recip,
             feeAmount:      fee,
-            nonce:          vault.nonces(stealthAddr), // 应为 0
+            nonce:          0,
             deadline:       block.timestamp + 1 hours
         });
 
-        // 3. 用影子私钥签名
-        bytes memory sig = _signClaimRequest(req, stealthPrivKey);
+        // 3. 用 stealthPk 签名
+        bytes memory sig = _signClaimRequest(req, stealthPk);
 
         // 4. Relayer 代发提款
-        uint256 employeeBefore = usdt.balanceOf(employee);
-        uint256 relayerBefore  = usdt.balanceOf(relayer);
-
         vm.prank(relayer);
         vault.claim(req, sig);
 
-        // 5. 断言：资金精确到账
-        assertEq(usdt.balanceOf(employee), employeeBefore + salary - fee, "employee net pay mismatch");
-        assertEq(usdt.balanceOf(relayer),  relayerBefore  + fee,          "relayer fee mismatch");
-
-        // 6. 断言：nonce 自增，防重放
-        assertEq(vault.nonces(stealthAddr), 1, "nonce should increment");
-
-        // 7. 断言：Vault 内余额清零
-        assertEq(vault.balances(address(usdt), stealthAddr), 0, "vault balance should be 0");
+        // 5. 核心断言
+        assertEq(usdt.balanceOf(recip),    salary - fee, "recipient should receive 990 USDT");
+        assertEq(usdt.balanceOf(relayer),  fee,          "relayer should receive 10 USDT");
+        assertEq(vault.balances(address(usdt), stealthAddress), 0, "vault balance should be zero");
+        assertEq(vault.nonces(stealthAddress), 1, "nonce must increment to 1");
     }
 
     /// @notice 原生 ETH 的分配与提款专项测试
@@ -253,7 +271,7 @@ contract StealthPayVaultTest is Test {
         // 重放攻击：相同的 req（nonce=0）和签名再次提交
         // 此时链上 nonces[stealthAddr] 已变为 1，必须 revert
         vm.prank(relayer);
-        vm.expectRevert(bytes("Invalid nonce"));
+        vm.expectRevert(abi.encodeWithSignature("InvalidNonce()"));
         vault.claim(req, sig);
     }
 
@@ -278,7 +296,66 @@ contract StealthPayVaultTest is Test {
         bytes memory sig = _signClaimRequest(req, stealthPrivKey);
 
         vm.prank(relayer);
-        vm.expectRevert(bytes("Signature expired"));
+        vm.expectRevert(abi.encodeWithSignature("SignatureExpired()"));
+        vault.claim(req, sig);
+    }
+
+    /// @notice 篡改 amount 或 recipient 后原签名失效
+    function test_RevertIf_TamperedPayload() public {
+        uint256 stealthPk      = 0xA11CE;
+        address stealthAddress = vm.addr(stealthPk);
+        address hacker         = makeAddr("hacker");
+
+        uint256 legit = 100 * 1e6; // 签名时的合法金额
+        _allocateUSDT(stealthAddress, legit);
+
+        StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddress,
+            token:          address(usdt),
+            amount:         legit,
+            recipient:      employee,
+            feeAmount:      0,
+            nonce:          0,
+            deadline:       block.timestamp + 1 hours
+        });
+        bytes memory sig = _signClaimRequest(req, stealthPk);
+
+        // 场景 A：篡改 amount（100 USDT → 余额中没有的 9999 USDT）
+        req.amount = 9_999 * 1e6;
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSignature("InvalidSignature()"));
+        vault.claim(req, sig);
+
+        // 场景 B：恢复 amount，改 recipient 为黑客地址
+        req.amount    = legit;
+        req.recipient = hacker;
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSignature("InvalidSignature()"));
+        vault.claim(req, sig);
+    }
+
+    /// @notice 余额不足时 claim 必须 revert
+    function test_RevertIf_InsufficientBalance() public {
+        uint256 stealthPk      = 0xA11CE;
+        address stealthAddress = vm.addr(stealthPk);
+
+        // 只分配 500 USDT
+        _allocateUSDT(stealthAddress, 500 * 1e6);
+
+        // 构造试图提取 1000 USDT 的请求（有效签名，但金额超过余额）
+        StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddress,
+            token:          address(usdt),
+            amount:         1_000 * 1e6, // 超额
+            recipient:      employee,
+            feeAmount:      0,
+            nonce:          0,
+            deadline:       block.timestamp + 1 hours
+        });
+        bytes memory sig = _signClaimRequest(req, stealthPk);
+
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSignature("InsufficientBalance()"));
         vault.claim(req, sig);
     }
 
@@ -308,7 +385,7 @@ contract StealthPayVaultTest is Test {
         req.feeAmount = 1_000 * 1e6;
 
         vm.prank(relayer);
-        vm.expectRevert(bytes("Invalid signature"));
+        vm.expectRevert(abi.encodeWithSignature("InvalidSignature()"));
         vault.claim(req, sig);
     }
 
@@ -316,18 +393,98 @@ contract StealthPayVaultTest is Test {
     // 模糊测试 & Gas 测试
     // -----------------------------------------------------------------------
 
-    /// @notice 随机金额输入下的溢出与边界测试
-    function testFuzz_AllocationAndClaim(uint96 amount, uint96 fee) public {
-        // TODO
+    /// @notice 随机金额下完整 allocate→claim 流程，断言资金分配无误
+    function testFuzz_AllocationAndClaim(uint256 allocateAmount, uint256 feeAmount) public {
+        vm.assume(allocateAmount > 0 && allocateAmount < 100_000_000 ether);
+        vm.assume(feeAmount <= allocateAmount);
+
+        uint256 stealthPk      = 0xA11CE;
+        address stealthAddress = vm.addr(stealthPk);
+        address recip          = makeAddr("fuzz_recipient");
+
+        // 按需铸造，避免依赖 setUp 中的固定余额
+        usdt.mint(owner, allocateAmount);
+
+        // Allocate
+        address[] memory addrs = new address[](1);
+        address[] memory toks  = new address[](1);
+        uint256[] memory amts  = new uint256[](1);
+        addrs[0] = stealthAddress;
+        toks[0]  = address(usdt);
+        amts[0]  = allocateAmount;
+
+        vm.startPrank(owner);
+        usdt.approve(address(vault), allocateAmount);
+        vault.batchAllocate(addrs, toks, amts);
+        vm.stopPrank();
+
+        // Claim
+        StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddress,
+            token:          address(usdt),
+            amount:         allocateAmount,
+            recipient:      recip,
+            feeAmount:      feeAmount,
+            nonce:          vault.nonces(stealthAddress),
+            deadline:       block.timestamp + 1 hours
+        });
+        bytes memory sig = _signClaimRequest(req, stealthPk);
+
+        vm.prank(relayer);
+        vault.claim(req, sig);
+
+        assertEq(usdt.balanceOf(recip),   allocateAmount - feeAmount, "recipient amount mismatch");
+        assertEq(usdt.balanceOf(relayer), feeAmount,                  "relayer fee mismatch");
     }
 
-    /// @notice 记录 batchAllocate 的 Gas 消耗
-    function test_GasCost_BatchAllocate() public {
-        // TODO
+    /// @notice 100 个隐身地址批量分配的 Gas 基准
+    function test_GasCost_BatchAllocate_100() public {
+        uint256 n = 100;
+        address[] memory addrs = new address[](n);
+        address[] memory toks  = new address[](n);
+        uint256[] memory amts  = new uint256[](n);
+
+        uint256 perAddr = 100 * 1e6; // 100 USDT each
+        for (uint256 i = 0; i < n; i++) {
+            addrs[i] = address(uint160(uint256(keccak256(abi.encode("s", i)))));
+            toks[i]  = address(usdt);
+            amts[i]  = perAddr;
+        }
+
+        vm.startPrank(owner);
+        usdt.approve(address(vault), perAddr * n);
+        uint256 gasBefore = gasleft();
+        vault.batchAllocate(addrs, toks, amts);
+        uint256 gasUsed = gasBefore - gasleft();
+        vm.stopPrank();
+
+        emit log_named_uint("batchAllocate(100) gas", gasUsed);
     }
 
-    /// @notice 记录 claim 的 Gas 消耗
+    /// @notice 单次 claim 的 Gas 基准
     function test_GasCost_Claim() public {
-        // TODO
+        uint256 stealthPk      = 0xA11CE;
+        address stealthAddress = vm.addr(stealthPk);
+        uint256 salary         = 1_000 * 1e6;
+
+        _allocateUSDT(stealthAddress, salary);
+
+        StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddress,
+            token:          address(usdt),
+            amount:         salary,
+            recipient:      employee,
+            feeAmount:      10 * 1e6,
+            nonce:          0,
+            deadline:       block.timestamp + 1 hours
+        });
+        bytes memory sig = _signClaimRequest(req, stealthPk);
+
+        uint256 gasBefore = gasleft();
+        vm.prank(relayer);
+        vault.claim(req, sig);
+        uint256 gasUsed = gasBefore - gasleft();
+
+        emit log_named_uint("claim gas", gasUsed);
     }
 }
