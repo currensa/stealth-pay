@@ -296,12 +296,79 @@ relayer   ← fee
 
 ---
 
+## 阶段 8：TypeScript SDK（链下 ECDH 影子密钥推导）
+
+### 目标
+将合约侧的密码学协议在链下复现：员工用 JS/TS 推导影子私钥，完成独立的密钥管理闭环。
+
+### 技术选型
+| 库 | 用途 |
+|----|------|
+| `@noble/curves` | secp256k1 椭圆曲线运算（ProjectivePoint, CURVE.n） |
+| `@noble/hashes` | keccak_256 散列 |
+| `viem/accounts` | `privateKeyToAccount` 验证以太坊地址 |
+| `vitest` | TypeScript 单元测试框架 |
+
+### TDD 流程
+
+#### RED
+三个测试（先行）：
+1. **主链路**：`metaPrivKey → metaPubKey → HR 计算 stealthAddress → 员工恢复 stealthPrivKey → 断言地址吻合`
+2. **一次性特性**：不同 `ephemeralKey` 生成不同 stealth 地址
+3. **格式断言**：`getMetaPublicKey` 输出匹配 `/^0x04[0-9a-f]{128}$/i`（未压缩格式）
+
+红灯：`Error: Failed to load url ../src/StealthKey.js — Does the file exist?`
+
+#### GREEN — 核心密码学实现
+
+```typescript
+// ECDH：scalar × point → 压缩字节（33 B）
+function sharedSecret(scalarHex, pubHex): Uint8Array {
+  return secp256k1.ProjectivePoint.fromHex(pubHex)
+    .multiply(BigInt('0x' + scalarHex))
+    .toRawBytes(true); // compressed
+}
+
+// h = keccak256(sharedSecret) mod n
+function sharedSecretToScalar(secret): bigint {
+  return BigInt('0x' + bytesToHex(keccak_256(secret))) % CURVE_ORDER;
+}
+
+// HR 端
+export function computeStealthAddress(metaPub, ephemeralPriv) {
+  const h = sharedSecretToScalar(sharedSecret(ephemeralPriv, metaPub));
+  const stealthPoint = secp256k1.ProjectivePoint.fromHex(metaPub)
+    .add(secp256k1.ProjectivePoint.BASE.multiply(h));
+  // ...
+}
+
+// 员工端
+export function recoverStealthPrivateKey(metaPriv, ephemeralPub) {
+  const h = sharedSecretToScalar(sharedSecret(metaPriv, ephemeralPub));
+  return (metaPrivBigInt + h) % CURVE_ORDER;
+}
+```
+
+#### 验证 GREEN
+
+```
+✓ test/StealthKey.test.ts (3 tests) 59ms
+Test Files  1 passed (1)
+     Tests  3 passed (3)
+```
+
+### 关键决策
+- **ECDH 对称性**：`ephemeralPriv · metaPub = metaPriv · ephemeralPub`，两端独立计算同一共享密钥
+- **压缩格式**：共享密钥取压缩形式（33 B）再做 keccak256，与 EIP-5564 参考实现对齐
+- **以太坊地址推导**：`keccak256(uncompressed[1:])[12:]`（去掉 0x04 前缀，取哈希最后 20 字节）
+
+---
+
 ## 待完善（TODO）
 
 | 项目 | 说明 |
 |------|------|
 | `test_NativeETH_Flow` | ETH 完整提款流程专项测试 |
 | `test_RevertIf_SignatureMalleability` | 构造 high-s 签名，验证 OZ ECDSA 拦截 |
-| 前端集成 | ECDH 影子地址推导（链下 JS/TS） |
 | 部署脚本 | Foundry `script/Deploy.s.sol` |
 | Natspec 完善 | 所有 public 接口补全文档注释 |
