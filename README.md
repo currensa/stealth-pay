@@ -182,13 +182,11 @@ const stealthPriv = recoverStealthPrivateKey(metaPrivKey, ephemeralPub);
 `sdk/test/e2e.integration.test.ts` 使用 Anvil + viem 验证完整链路：
 
 ```
-HR: computeStealthAddress → approve → batchAllocate
+HR: computeStealthAddress → StandardMerkleTree.of → depositForPayroll
 Employee: recoverStealthPrivateKey → signTypedData (EIP-712)
-Relayer: claim → broadcast
+Relayer: claim(req, sig, proof, root) → broadcast
 Assert: recipient +4950 USDT, relayer +50 USDT
 ```
-
-> **注意：** E2E 测试基于旧版 `batchAllocate` 接口，待迁移至 Merkle 架构。
 
 ---
 
@@ -270,15 +268,23 @@ deadline → isClaimed → feeAmount ≤ amount → activeRoots[root]
 
 ---
 
-## 九、待完善
+## 九、部署
 
-| 项目 | 说明 |
-|------|------|
-| `test_NativeETH_Flow` | ETH 完整提款流程专项测试 |
-| `test_RevertIf_SignatureMalleability` | 构造 high-s 签名，验证 OZ ECDSA 拦截 |
-| E2E 测试迁移 | `sdk/test/e2e.integration.test.ts` 升级到 Merkle 接口 |
-| 部署脚本 | `script/Deploy.s.sol` |
-| NatSpec 完善 | 所有 public 接口补全文档注释 |
+```bash
+# 本地 Anvil 测试部署
+PRIVATE_KEY=0xac0974... forge script script/Deploy.s.sol \
+  --rpc-url http://127.0.0.1:8545 \
+  --broadcast
+
+# 主网 / 测试网部署
+PRIVATE_KEY=$YOUR_KEY forge script script/Deploy.s.sol \
+  --rpc-url $RPC_URL \
+  --broadcast \
+  --verify \
+  --etherscan-api-key $ETHERSCAN_KEY
+```
+
+`PRIVATE_KEY` 持有者将自动成为合约 Owner（即企业多签地址）。
 
 ---
 

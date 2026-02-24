@@ -1,11 +1,11 @@
 /**
- * E2E 全链路集成测试
+ * E2E 全链路集成测试（Merkle 架构 v2.0）
  *
- * 模拟真实世界中"HR 发薪 → 员工签名 → 中继器代发"的完整闭环：
+ * 模拟真实世界中「HR 发薪 → 员工签名 → 中继器代发」的完整闭环：
  *
- * [角色 1] HR          → computeStealthAddress → batchAllocate（链上）
+ * [角色 1] HR          → computeStealthAddress → buildMerkleTree → depositForPayroll（链上）
  * [角色 2] Employee    → recoverStealthPrivateKey → signTypedData（链下签名）
- * [角色 3] Relayer     → claim（链上代发，自付 gas）
+ * [角色 3] Relayer     → claim(req, sig, proof, root)（链上代发，自付 gas）
  *
  * 使用本地 Anvil 节点 + 真实编译产物（out/）进行全链路验证。
  */
@@ -16,6 +16,7 @@ import type { ChildProcess } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { StandardMerkleTree } from '@openzeppelin/merkle-tree';
 import {
   createPublicClient,
   createWalletClient,
@@ -124,9 +125,9 @@ afterAll(() => {
 
 // ─── 测试 ───────────────────────────────────────────────────────────────────
 
-describe('Complete Stealth Payroll Flow', () => {
+describe('Complete Stealth Payroll Flow (Merkle v2)', () => {
   it(
-    'HR 分配 → 员工恢复影子私钥并签名 → Relayer 代发 → recipient 精准到账 4950，relayer 获得 50',
+    'HR depositForPayroll → 员工恢复影子私钥并签名 → Relayer claim → recipient 精准到账 4950，relayer 获得 50',
     async () => {
       // ── [角色 1] HR 发薪 ───────────────────────────────────────────────────
 
@@ -139,8 +140,18 @@ describe('Complete Stealth Payroll Flow', () => {
 
       // HR 推导员工本月影子地址
       const { stealthAddress } = computeStealthAddress(metaPubKey, ephemeralPriv);
+      const stealthAddr = getAddress(stealthAddress) as Address;
 
-      // HR 铸造 USDT → approve vault → batchAllocate
+      // HR 构建 Merkle Tree（叶子：[stealthAddress, token, amount]）
+      // StandardMerkleTree 叶子格式：keccak256(keccak256(abi.encode(values)))
+      const tree = StandardMerkleTree.of(
+        [[stealthAddr, getAddress(usdtAddress), USDT_AMOUNT.toString()]],
+        ['address', 'address', 'uint256'],
+      );
+      const merkleRoot = tree.root as Hex;
+      const merkleProof = tree.getProof(0) as Hex[];
+
+      // HR 铸造 USDT → approve vault → depositForPayroll
       await walletClient.writeContract({
         address: usdtAddress, abi: usdtArtifact.abi,
         functionName: 'mint',
@@ -155,43 +166,31 @@ describe('Complete Stealth Payroll Flow', () => {
         account: hrAccount,
       });
 
-      const allocHash = await walletClient.writeContract({
+      const depositHash = await walletClient.writeContract({
         address: vaultAddress, abi: vaultArtifact.abi,
-        functionName: 'batchAllocate',
-        args: [
-          [getAddress(stealthAddress)],
-          [usdtAddress],
-          [USDT_AMOUNT],
-        ],
+        functionName: 'depositForPayroll',
+        args: [merkleRoot, getAddress(usdtAddress), USDT_AMOUNT],
         account: hrAccount,
       });
-      await publicClient.waitForTransactionReceipt({ hash: allocHash });
+      await publicClient.waitForTransactionReceipt({ hash: depositHash });
 
       // ── [角色 2] 员工恢复影子私钥并签名 ───────────────────────────────────
 
       // 员工拿到 HR 公告的 ephemeralPub，推导影子私钥
-      const stealthPriv   = recoverStealthPrivateKey(META_PRIV, ephemeralPub) as Hex;
+      const stealthPriv    = recoverStealthPrivateKey(META_PRIV, ephemeralPub) as Hex;
       const stealthAccount = privateKeyToAccount(stealthPriv);
 
       // 双重验证：影子私钥对应的地址 == HR 计算的 stealthAddress
       expect(stealthAccount.address.toLowerCase()).toBe(stealthAddress.toLowerCase());
 
-      // 读取链上 nonce
-      const nonce = await publicClient.readContract({
-        address: vaultAddress, abi: vaultArtifact.abi,
-        functionName: 'nonces',
-        args: [stealthAccount.address],
-      }) as bigint;
-
       const deadline = BigInt(Math.floor(Date.now() / 1000) + 3_600);
 
       const claimReq = {
         stealthAddress: stealthAccount.address as Address,
-        token:          usdtAddress,
+        token:          getAddress(usdtAddress),
         amount:         USDT_AMOUNT,
         recipient:      recipientAddress,
         feeAmount:      FEE_AMOUNT,
-        nonce,
         deadline,
       };
 
@@ -211,7 +210,6 @@ describe('Complete Stealth Payroll Flow', () => {
             { name: 'amount',         type: 'uint256' },
             { name: 'recipient',      type: 'address' },
             { name: 'feeAmount',      type: 'uint256' },
-            { name: 'nonce',          type: 'uint256' },
             { name: 'deadline',       type: 'uint256' },
           ],
         },
@@ -224,7 +222,7 @@ describe('Complete Stealth Payroll Flow', () => {
       const claimHash = await walletClient.writeContract({
         address: vaultAddress, abi: vaultArtifact.abi,
         functionName: 'claim',
-        args: [claimReq, signature],
+        args: [claimReq, signature, merkleProof, merkleRoot],
         account: relayerAccount,
       });
       await publicClient.waitForTransactionReceipt({ hash: claimHash });

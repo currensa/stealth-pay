@@ -88,11 +88,12 @@ contract StealthPayVaultTest is Test {
     // 测试辅助函数
     // -----------------------------------------------------------------------
 
-    /// @dev 标准叶子哈希：keccak256(abi.encodePacked(stealth, token, amount))
+    /// @dev 标准叶子哈希：keccak256(keccak256(abi.encode(stealth, token, amount)))
+    ///      与 openzeppelin merkle-tree StandardMerkleTree 格式兼容（双重哈希）
     function _leaf(address stealth, address token, uint256 amount)
         internal pure returns (bytes32)
     {
-        return keccak256(abi.encodePacked(stealth, token, amount));
+        return keccak256(bytes.concat(keccak256(abi.encode(stealth, token, amount))));
     }
 
     /// @dev 2-叶 Merkle Root（OZ 排序方式：小哈希在左）

@@ -191,8 +191,9 @@ contract StealthPayVault is Ownable, ReentrancyGuard {
         if (!activeRoots[root]) revert InvalidRoot();
 
         // 5. Merkle Proof 验证
-        //    叶子格式：keccak256(abi.encodePacked(stealthAddress, token, amount))
-        bytes32 leaf = keccak256(abi.encodePacked(stealth, req.token, req.amount));
+        //    叶子格式：keccak256(keccak256(abi.encode(stealthAddress, token, amount)))
+        //    与 @openzeppelin/merkle-tree StandardMerkleTree 格式兼容（双重哈希）
+        bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(stealth, req.token, req.amount))));
         if (!MerkleProof.verify(merkleProof, root, leaf)) revert InvalidMerkleProof();
 
         // 6. EIP-712 验签（先于状态更新，防余额/信息泄露）
