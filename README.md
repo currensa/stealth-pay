@@ -1,111 +1,285 @@
-# Stealth-Pay v1.0: 企业级隐私资金分发与无感提取系统
+# StealthPay — 企业级隐私发薪系统
 
-## 一、 项目背景 (Project Background)
+> **版本：** v2.0 (Merkle Tree 架构) | **框架：** Foundry + TypeScript SDK | **网络：** EVM 兼容链
 
-在 Web3 企业和 DAO 的日常运营中，"链上发薪"是一个高频且痛点极多的场景。传统的链上转账存在严重的隐私泄露问题：如果企业通过多签钱包直接向员工的常用地址打款，任何人都可以通过区块链浏览器轻易推导出公司的**"完整员工名单"**以及**"内部薪资结构"**。
-
-为了解决这个问题，我们需要构建一套专用的**企业级隐私发薪系统 (Shadow-Payroll)**。我们不追求极其昂贵且复杂的全域零知识证明（ZK）方案，而是立足于 2026 年以太坊主网现状，通过"逻辑隔离"与"元交易"的结合，在**隐私保护、主网 Gas 成本、用户体验**之间取得完美的商业平衡。
-
-## 二、 核心设计目标 (Core Design Objectives)
-
-系统必须严格满足以下四个维度的指标：
-
-1. **隐私性 (Linkability Breaking)：** 必须在链上切断"资金发送方（企业 Vault）"与"最终接收方（员工常用地址）"之间的显性关联。员工之间不能通过链上数据互相查阅薪资。
-2. **冷启动无感提取 (Zero-Gas Execution)：** 接收方无需预先持有任何 ETH 作为 Gas 费。系统必须支持"白板地址"独立完成提款。
-3. **全资产兼容 (Universal Asset Compatibility)：** 必须原生支持主流 ERC-20 Token（如 USDT/USDC）和 Native ETH，且架构需具备向 ERC-721 扩展的潜力。
-4. **企业自托管 (Self-Custody) 与极简依赖：** 资金由企业的智能合约绝对控制，不依赖外部的混币池。同时，**不能强制要求员工使用特定的、尚未普及的隐私钱包**，所有密码学操作需封装在轻量级的 Web 前端中完成。
-
-## 三、 核心架构决策 (Architecture Decisions)
-
-**为什么不直接用"EIP-5564 + ERC-4337 Paymaster"？**
-在以太坊主网上，为每一个员工部署独立的 ERC-4337 智能合约账户成本极高，且严重依赖第三方基础设施（Bundler/Paymaster）。
-
-**我们的破局方案：隐身地址映射 + 智能合约记账 + EIP-712 中继提取**
-
-1. **隐身地址生成：** 参考 EIP-5564 的椭圆曲线 Diffie-Hellman (ECDH) 思想，在链下为员工生成一次性的影子 EOA 地址 ()。
-2. **Vault 集中记账：** 企业的钱不直接打进这个影子 EOA（因为 EOA 没 ETH 无法发起交易），而是打入我们定制的 `PayrollVault` 智能合约中，在合约内部将资金映射到该影子地址名下。
-3. **签名即提款：** 员工用影子私钥签署 EIP-712 指令，由企业的中继器（Relayer）代付 ETH 提交给 `PayrollVault`，合约验证签名后将资金直接推送到员工指定的最终交易所或冷钱包地址。
-
-## 四、 系统流转全流程 (System Workflow)
-
-### 阶段 1：初始化与脱敏 (Setup)
-
-* **员工端：** 员工在公司的 Web 门户连接常用钱包，对固定消息（如 `Shadow-Payroll-2026`）签名，前端以此为种子派生出**隐身元公钥 (Stealth Meta-PublicKey)** 。
-* **HR 登记：** 员工将  交给 HR。注意：企业并未收集员工的真实收款地址。
-
-### 阶段 2：隐私发薪 (Batch Allocation)
-
-* **链下计算：** 每月发薪时，HR 的系统利用当月的随机盐（Ephemeral Key）与员工的  结合，计算出当月的**影子地址 (Stealth Address)** 。
-* **链上分配：** 企业多签钱包调用 `PayrollVault` 合约的 `batchAllocate` 函数，将总资金打入合约，并附带  列表和对应金额。资金在链上的状态变为"锁定在 Vault 中，归属于各个白板 "。
-
-### 阶段 3：无感提取 (Zero-Gas Claim)
-
-* **前端操作：** 员工登录 Web 门户，系统自动推导出  的私钥 。员工输入最终的收款地址（如币安充值地址），并同意支付少量 USDT 给 Relayer 作为 Gas 补偿。
-* **签名构建：** 前端使用  构建并签署一条 **EIP-712 提款指令**。
-* **中继上链：** 员工将签名发送给 Relayer。Relayer 垫付主网 ETH，调用 Vault 的 `claim` 函数。Vault 验证签名、扣除手续费发给 Relayer，并将剩余薪资发给员工指定的最终地址。
+在 Web3 企业和 DAO 的日常运营中，"链上发薪"存在严重的隐私泄露问题：通过区块链浏览器可以轻易推导出公司的**完整员工名单**和**内部薪资结构**。StealthPay 通过 ECDH 隐身地址 + Merkle Tree + EIP-712 中继提取的组合，在隐私保护、Gas 成本与用户体验之间取得平衡。
 
 ---
 
-## 五、 智能合约设计规范 (Solidity Spec)
+## 一、设计目标
 
-请使用 **Foundry** 框架进行开发，Solidity 版本建议 `>=0.8.20`。
-核心合约 `PayrollVault.sol` 需要实现以下关键接口和逻辑：
+| 目标 | 方案 |
+|------|------|
+| **隐私性** | 链上只可见 32 字节 Merkle Root，员工地址与金额完全链下保管 |
+| **冷启动无感提取** | 员工签名，Relayer 垫付 Gas，影子地址无需持有 ETH |
+| **全资产兼容** | 原生支持 ERC-20（USDT/USDC）与 Native ETH |
+| **企业自托管** | 资金由企业智能合约绝对控制，无外部混币依赖 |
+
+---
+
+## 二、系统架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     链下（Off-Chain）                        │
+│                                                             │
+│  员工：meta_priv ──→ meta_pub（提交 HR）                    │
+│                                                             │
+│  HR  ：ephemeral_priv + meta_pub                            │
+│        ──→ stealth_address（本月影子地址）                   │
+│        ──→ Merkle Tree（所有员工叶子 → root）               │
+│                                                             │
+│  员工：meta_priv + ephemeral_pub                            │
+│        ──→ stealth_priv（可签名提款）                       │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                   StealthPayVault（链上）                    │
+│                                                             │
+│  depositForPayroll(merkleRoot, token, total)                │
+│    activeRoots[root] = true                                 │
+│                                                             │
+│  claim(req, sig, merkleProof[], root)                       │
+│    ① deadline ② isClaimed ③ fee ≤ amount                   │
+│    ④ activeRoots[root] ⑤ MerkleProof.verify               │
+│    ⑥ ECDSA.recover == stealthAddress                       │
+│    ⑦ isClaimed[stealth] = true                             │
+│    ⑧ transfer(recipient, net) + transfer(relayer, fee)     │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+              recipient ←──┘← net
+              relayer   ←───── fee
+```
+
+### 密码学核心（ECDH 隐身地址）
+
+```
+sharedSecret  = ECDH(ephemeralPriv, metaPub)     // = metaPriv · ephemeralPub
+h             = keccak256(compress(sharedSecret)) mod n
+stealthPub    = metaPub + h·G                    // 椭圆曲线点加法
+stealthPriv   = (metaPriv + h) mod n             // 标量加法
+stealthAddress = keccak256(stealthPub[1:])[12:]  // 以太坊地址
+```
+
+---
+
+## 三、项目结构
+
+```
+stealth-pay/
+├── src/
+│   └── StealthPayVault.sol     # 核心合约（Merkle + EIP-712）
+├── test/
+│   └── StealthPayVault.t.sol   # Foundry 测试套件（11 个测试）
+├── sdk/
+│   ├── src/
+│   │   └── StealthKey.ts       # ECDH 影子密钥推导 SDK
+│   └── test/
+│       ├── StealthKey.test.ts  # SDK 单元测试
+│       └── e2e.integration.test.ts  # 全链路 E2E 测试（Anvil）
+├── lib/
+│   ├── forge-std/
+│   └── openzeppelin-contracts/
+├── foundry.toml
+└── DEVLOG.md                   # 完整开发日志（10 个阶段）
+```
+
+---
+
+## 四、智能合约接口
+
+### 状态变量
 
 ```solidity
-// 核心状态变量
-// token => (stealthAddress => balance)
-mapping(address => mapping(address => uint256)) public balances;
-// stealthAddress => nonce (防重放)
-mapping(address => uint256) public nonces;
+mapping(bytes32 => bool) public activeRoots;   // 合法发薪 Root 集合
+mapping(address => bool) public isClaimed;     // 影子地址是否已提款
+bytes32 public constant CLAIM_TYPEHASH;        // EIP-712 类型哈希
+bytes32 public immutable DOMAIN_SEPARATOR;     // 链 ID + 合约地址绑定
+```
 
-// EIP-712 提款结构体
+### 发薪（仅 Owner）
+
+```solidity
+function depositForPayroll(
+    bytes32 merkleRoot,   // 本期所有叶子构成的树根
+    address token,        // 代币地址（address(0) = ETH）
+    uint256 totalAmount   // 本期总发薪额
+) external payable onlyOwner;
+```
+
+### 提款（Relayer 代发）
+
+```solidity
 struct ClaimRequest {
-    address stealthAddress; // 拥有资金的影子地址
-    address token;          // 代币地址 (address(0) 为原生 ETH)
-    uint256 amount;         // 提取总额
-    address recipient;      // 实际接收资金的最终地址
-    uint256 feeAmount;      // 支付给 msg.sender (Relayer) 的代币数量
-    uint256 nonce;          // 必须匹配 nonces[stealthAddress]
+    address stealthAddress; // 资金所属影子地址
+    address token;          // 代币地址
+    uint256 amount;         // 提取总额（必须与 Merkle 叶子完全一致）
+    address recipient;      // 最终收款地址（如交易所充值地址）
+    uint256 feeAmount;      // Relayer 手续费
     uint256 deadline;       // 签名过期时间戳
 }
 
-// 接口 1: 批量发薪 (需具备权限控制)
-function batchAllocate(
-    address[] calldata stealthAddresses,
-    address[] calldata tokens,
-    uint256[] calldata amounts
-) external payable onlyOwner;
-
-// 接口 2: 签名提款 (由 Relayer 调用)
 function claim(
     ClaimRequest calldata req,
-    bytes calldata signature
+    bytes calldata signature,      // 影子私钥的 EIP-712 签名
+    bytes32[] calldata merkleProof, // 从叶子到 root 的路径
+    bytes32 root                   // 发薪 Merkle Root
 ) external nonReentrant;
-
 ```
 
-*安全提示：必须实现严谨的 `ecrecover` 逻辑，且 `domainSeparator` 需绑定 `block.chainid` 和 `address(this)`。*
+### Merkle 叶子格式
+
+```solidity
+bytes32 leaf = keccak256(abi.encodePacked(stealthAddress, token, amount));
+```
+
+### 自定义错误
+
+| 错误 | 触发条件 |
+|------|---------|
+| `SignatureExpired()` | `block.timestamp > req.deadline` |
+| `AlreadyClaimed()` | `isClaimed[stealthAddress] == true` |
+| `FeeExceedsAmount()` | `feeAmount > amount` |
+| `InvalidRoot()` | `root` 不在 `activeRoots` |
+| `InvalidMerkleProof()` | Merkle 路径验证失败 |
+| `InvalidSignature()` | EIP-712 恢复地址不匹配 |
+| `EthAmountMismatch()` | ETH 存款金额与参数不符 |
+| `EthTransferFailed()` | ETH 转账调用失败 |
 
 ---
 
-## 六、 强制测试策略 (Testing Strategy via Foundry)
+## 五、TypeScript SDK
 
-必须提供高覆盖率的测试用例，涵盖以下维度：
+```bash
+cd sdk && npm install
+npm test          # 运行所有测试（单元 + E2E）
+```
 
-### 1. 核心链路测试 (Happy Path)
+### 核心 API
 
-* `test_BatchAllocate()`: 验证分配逻辑正确，非权限用户调用被拦截。
-* `test_ClaimWithValidSignature()`: 验证完整的 EIP-712 提款流程，断言 `recipient` 和 `relayer` 的余额增加完全准确。
-* `test_NativeETH_Flow()`: 针对原生 ETH 分配与提取的专项测试。
+```typescript
+import {
+  getMetaPublicKey,           // 员工：私钥 → 未压缩公钥
+  computeStealthAddress,      // HR：ECDH → 影子地址 + 公钥
+  recoverStealthPrivateKey,   // 员工：ECDH → 影子私钥
+} from './src/StealthKey.js';
 
-### 2. 密码学与边界安全测试 (Security Limits)
+// 员工端
+const metaPub = getMetaPublicKey(metaPrivKey);
 
-* `test_RevertIf_ReplayAttack()`: 模拟重放攻击，确保第二次提交相同签名因 Nonce 递增而失败。
-* `test_RevertIf_ExpiredDeadline()`: 测试超时签名被拒绝。
-* `test_RevertIf_SignatureMalleability()`: 验证防范签名延展性攻击（建议直接使用 OpenZeppelin ECDSA 库）。
-* `test_RevertIf_WrongSigner()`: 篡改 `ClaimRequest` 中的金额或收款人，验证签名恢复出的地址与 `stealthAddress` 不匹配并拦截。
+// HR 端
+const { stealthAddress, stealthPublicKey } = computeStealthAddress(
+  metaPub,
+  ephemeralPrivKey,
+);
 
-### 3. 性能与极限测试 (Fuzz & Gas)
+// 员工端（提款时）
+const stealthPriv = recoverStealthPrivateKey(metaPrivKey, ephemeralPub);
+```
 
-* `testFuzz_AllocationAndClaim()`: 使用随机的大额/极小额输入测试溢出与边界。
-* `test_GasCost_BatchAllocate()` & `test_GasCost_Claim()`: 打印 Gas 消耗报告。在以太坊主网背景下，`claim` 的 Gas 必须优化至极限。
+### E2E 集成测试
+
+`sdk/test/e2e.integration.test.ts` 使用 Anvil + viem 验证完整链路：
+
+```
+HR: computeStealthAddress → approve → batchAllocate
+Employee: recoverStealthPrivateKey → signTypedData (EIP-712)
+Relayer: claim → broadcast
+Assert: recipient +4950 USDT, relayer +50 USDT
+```
+
+> **注意：** E2E 测试基于旧版 `batchAllocate` 接口，待迁移至 Merkle 架构。
+
+---
+
+## 六、快速开始
+
+### 合约
+
+```bash
+# 依赖
+git submodule update --init --recursive
+
+# 编译
+forge build
+
+# 全量测试（含 256 轮模糊测试）
+forge test -v
+```
+
+### SDK
+
+```bash
+cd sdk
+npm install
+npm test
+```
+
+### 本地 E2E
+
+```bash
+# 需要 Anvil 在后台运行（或由测试自动启动）
+cd sdk
+npm test test/e2e.integration.test.ts
+```
+
+---
+
+## 七、测试覆盖
+
+### Foundry（合约）
+
+| 测试 | 类型 | 验证内容 |
+|------|------|---------|
+| `test_DepositForPayroll` | 正常流程 | 存款后 `activeRoots[root] = true`，非 Owner 被拒 |
+| `test_ClaimWithValidSignature` | 正常流程 | 2-叶 Merkle + EIP-712 完整提款 + AlreadyClaimed 防双花 |
+| `test_RevertIf_ExpiredDeadline` | 安全边界 | 过期签名被 `SignatureExpired()` 拦截 |
+| `test_RevertIf_TamperedPayload` | 安全边界 | 篡改 amount → `InvalidMerkleProof`；篡改 recipient → `InvalidSignature` |
+| `test_RevertIf_WrongSigner` | 安全边界 | 篡改 feeAmount → EIP-712 签名不匹配 |
+| `test_RevertIf_InvalidRoot` | 安全边界 | 未注册 root → `InvalidRoot()` |
+| `test_RevertIf_InvalidMerkleProof` | 安全边界 | 错误 proof → `InvalidMerkleProof()` |
+| `testFuzz_AllocationAndClaim` | 模糊测试 | 256 轮随机金额，单叶退化树（root=leaf） |
+| `test_GasCost_Claim` | Gas 基准 | Merkle claim gas: ~192,036 |
+
+### SDK（TypeScript）
+
+| 测试 | 验证内容 |
+|------|---------|
+| ECDH 主链路 | 影子私钥 ↔ 影子地址完全吻合 |
+| 一次性特性 | 不同 ephemeral key → 不同影子地址 |
+| 格式断言 | `getMetaPublicKey` 输出 `0x04[128 hex]` |
+| E2E 全链路 | Anvil 上全流程验证（185ms） |
+
+---
+
+## 八、安全设计
+
+**claim 检查顺序（防信息泄露）：**
+```
+deadline → isClaimed → feeAmount ≤ amount → activeRoots[root]
+→ MerkleProof.verify → ECDSA.recover → isClaimed=true → 转账
+```
+
+**关键安全属性：**
+- Merkle Proof 和签名验证均在状态变更前完成（CEI 模式）
+- `isClaimed` 替代 `nonces`：每个影子地址全生命周期只能提款一次
+- OZ `ECDSA.recover`：自动防签名延展性（high-s 值）
+- `SafeERC20`：防不规范 token 静默失败
+- `nonReentrant`：防重入攻击
+- `block.chainid` + `address(this)` 绑定：防跨链/跨合约重放
+
+---
+
+## 九、待完善
+
+| 项目 | 说明 |
+|------|------|
+| `test_NativeETH_Flow` | ETH 完整提款流程专项测试 |
+| `test_RevertIf_SignatureMalleability` | 构造 high-s 签名，验证 OZ ECDSA 拦截 |
+| E2E 测试迁移 | `sdk/test/e2e.integration.test.ts` 升级到 Merkle 接口 |
+| 部署脚本 | `script/Deploy.s.sol` |
+| NatSpec 完善 | 所有 public 接口补全文档注释 |
+
+---
+
+> 完整开发过程（10 个 TDD 阶段）详见 [DEVLOG.md](./DEVLOG.md)。
