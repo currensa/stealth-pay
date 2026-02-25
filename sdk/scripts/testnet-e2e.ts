@@ -2,14 +2,14 @@
  * testnet-e2e.ts — StealthPayVault Sepolia 全链路测试脚本
  *
  * 用法：
- *   1. 在 sdk/.env 中填写 PRIVATE_KEY 和 SEPOLIA_RPC_URL
- *   2. 将下方 VAULT_ADDRESS / USDT_ADDRESS 替换为 forge script 部署后打印的实际地址
+ *   1. 在 sdk/.env 中填写 HR_PRIVATE_KEY、RELAYER_PRIVATE_KEY 和 SEPOLIA_RPC_URL
+ *   2. 在 sdk/.env 中填写 VAULT_ADDRESS 和 USDT_ADDRESS（forge script 部署后打印的地址）
  *   3. npx tsx sdk/scripts/testnet-e2e.ts
  *
- * 流程：
- *   [HR]      computeStealthAddress → depositForPayroll
- *   [Employee] recoverStealthPrivateKey → signTypedData (EIP-712)
- *   [Relayer]  claim(req, sig, proof, root)
+ * 角色隔离：
+ *   [HR]      hrClient     → approve + depositForPayroll
+ *   [Employee] stealthAccount → signTypedData (EIP-712, 纯本地密码学，无 gas)
+ *   [Relayer]  relayerClient → claim(req, sig, proof, root)
  */
 
 import 'dotenv/config';
@@ -39,13 +39,19 @@ import {
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT  = resolve(__dirname, '../../'); // sdk/scripts/ → stealth-pay/
 
-// ─── !! 部署后请替换为真实地址 !! ──────────────────────────────────────────
+// ─── 环境变量 ───────────────────────────────────────────────────────────────
 
-const VAULT_ADDRESS = process.env.VAULT_ADDRESS as Address | undefined;
-const USDT_ADDRESS  = process.env.USDT_ADDRESS  as Address | undefined;
+const HR_PRIVATE_KEY      = process.env.HR_PRIVATE_KEY      as Hex | undefined;
+const RELAYER_PRIVATE_KEY = process.env.RELAYER_PRIVATE_KEY as Hex | undefined;
+const RPC_URL             = process.env.SEPOLIA_RPC_URL      as string | undefined;
+const VAULT_ADDRESS       = process.env.VAULT_ADDRESS        as Address | undefined;
+const USDT_ADDRESS        = process.env.USDT_ADDRESS         as Address | undefined;
 
-if (!VAULT_ADDRESS) throw new Error('Missing VAULT_ADDRESS in .env');
-if (!USDT_ADDRESS)  throw new Error('Missing USDT_ADDRESS in .env');
+if (!HR_PRIVATE_KEY)      throw new Error('Missing HR_PRIVATE_KEY in .env');
+if (!RELAYER_PRIVATE_KEY) throw new Error('Missing RELAYER_PRIVATE_KEY in .env');
+if (!RPC_URL)             throw new Error('Missing SEPOLIA_RPC_URL in .env');
+if (!VAULT_ADDRESS)       throw new Error('Missing VAULT_ADDRESS in .env');
+if (!USDT_ADDRESS)        throw new Error('Missing USDT_ADDRESS in .env');
 
 // ─── ABI（forge build 后从 out/ 读取）──────────────────────────────────────
 
@@ -56,25 +62,26 @@ const usdtArtifact = JSON.parse(
   readFileSync(resolve(REPO_ROOT, 'out/ERC20Mock.sol/ERC20Mock.json'), 'utf-8'),
 );
 
-// ─── 环境变量 ───────────────────────────────────────────────────────────────
+// ─── 账户实例化 ─────────────────────────────────────────────────────────────
 
-const PRIVATE_KEY = process.env.PRIVATE_KEY as Hex | undefined;
-const RPC_URL     = process.env.SEPOLIA_RPC_URL as string | undefined;
+const hrAccount      = privateKeyToAccount(HR_PRIVATE_KEY);
+const relayerAccount = privateKeyToAccount(RELAYER_PRIVATE_KEY);
 
-if (!PRIVATE_KEY) throw new Error('Missing PRIVATE_KEY in .env');
-if (!RPC_URL)     throw new Error('Missing SEPOLIA_RPC_URL in .env');
-
-// ─── Viem 客户端 ────────────────────────────────────────────────────────────
-
-const deployerAccount = privateKeyToAccount(PRIVATE_KEY);
+// ─── 客户端（hrClient 负责 HR 操作，relayerClient 负责代发 claim）──────────
 
 const publicClient = createPublicClient({
   chain:     sepolia,
   transport: http(RPC_URL),
 });
 
-const walletClient = createWalletClient({
-  account:   deployerAccount,
+const hrClient = createWalletClient({
+  account:   hrAccount,
+  chain:     sepolia,
+  transport: http(RPC_URL),
+});
+
+const relayerClient = createWalletClient({
+  account:   relayerAccount,
   chain:     sepolia,
   transport: http(RPC_URL),
 });
@@ -88,9 +95,10 @@ const FEE_AMOUNT = parseEther('50');   //    50 USDT（Relayer 手续费）
 
 async function main(): Promise<void> {
   console.log('=== StealthPay Sepolia E2E ===');
-  console.log(`Deployer / HR / Relayer : ${deployerAccount.address}`);
-  console.log(`Vault                   : ${VAULT_ADDRESS}`);
-  console.log(`Mock USDT               : ${USDT_ADDRESS}`);
+  console.log(`HR / Deployer : ${hrAccount.address}`);
+  console.log(`Relayer       : ${relayerAccount.address}`);
+  console.log(`Vault         : ${VAULT_ADDRESS}`);
+  console.log(`Mock USDT     : ${USDT_ADDRESS}`);
 
   // ── [本地密码学] 生成影子地址 ──────────────────────────────────────────────
   // 员工的 meta 私钥（测试网固定值，生产环境员工自持）
@@ -101,7 +109,7 @@ async function main(): Promise<void> {
   const metaPub      = getMetaPublicKey(META_PRIV);
   const ephemeralPub = getMetaPublicKey(EPHEMERAL_PRIV);
   const { stealthAddress } = computeStealthAddress(metaPub, EPHEMERAL_PRIV);
-  console.log(`\nStealth address         : ${stealthAddress}`);
+  console.log(`\nStealth address : ${stealthAddress}`);
 
   // ── [构建 Merkle 树] ────────────────────────────────────────────────────────
   const tree = StandardMerkleTree.of(
@@ -110,12 +118,11 @@ async function main(): Promise<void> {
   );
   const merkleRoot  = tree.root as Hex;
   const merkleProof = tree.getProof(0) as Hex[];
-  console.log(`Merkle root             : ${merkleRoot}`);
+  console.log(`Merkle root     : ${merkleRoot}`);
 
-  // ── [链上交互 1] HR 发薪：approve + depositForPayroll ─────────────────────
-
-  console.log('\n[1/4] Approving Mock USDT to Vault...');
-  const approveTx = await walletClient.writeContract({
+  // ── [链上交互 1] HR approve（hrClient 发起）────────────────────────────────
+  console.log('\n[1/4] HR approving Mock USDT to Vault...');
+  const approveTx = await hrClient.writeContract({
     address:      USDT_ADDRESS,
     abi:          usdtArtifact.abi,
     functionName: 'approve',
@@ -124,8 +131,9 @@ async function main(): Promise<void> {
   await publicClient.waitForTransactionReceipt({ hash: approveTx });
   console.log(`  tx: ${approveTx}`);
 
-  console.log('[2/4] depositForPayroll...');
-  const depositTx = await walletClient.writeContract({
+  // ── [链上交互 2] HR depositForPayroll（hrClient 发起）─────────────────────
+  console.log('[2/4] HR depositForPayroll...');
+  const depositTx = await hrClient.writeContract({
     address:      VAULT_ADDRESS,
     abi:          vaultArtifact.abi,
     functionName: 'depositForPayroll',
@@ -134,8 +142,7 @@ async function main(): Promise<void> {
   await publicClient.waitForTransactionReceipt({ hash: depositTx });
   console.log(`  tx: ${depositTx}`);
 
-  // ── [本地密码学] 员工恢复影子私钥并签名 ───────────────────────────────────
-
+  // ── [本地密码学] 员工恢复影子私钥并签名（纯本地，无 gas）─────────────────
   const stealthPriv    = recoverStealthPrivateKey(META_PRIV, ephemeralPub) as Hex;
   const stealthAccount = privateKeyToAccount(stealthPriv);
   const deadline       = BigInt(Math.floor(Date.now() / 1000) + 3_600);
@@ -144,13 +151,13 @@ async function main(): Promise<void> {
     stealthAddress: stealthAccount.address as Address,
     token:          getAddress(USDT_ADDRESS),
     amount:         AMOUNT,
-    recipient:      deployerAccount.address, // 收款至 deployer 地址
+    recipient:      hrAccount.address,  // 收款至 HR 地址
     feeAmount:      FEE_AMOUNT,
     deadline,
   };
 
-  const signature = await walletClient.signTypedData({
-    account:     stealthAccount,
+  const signature = await hrClient.signTypedData({
+    account: stealthAccount,
     domain: {
       name:              'StealthPay',
       version:           '1',
@@ -172,10 +179,9 @@ async function main(): Promise<void> {
   });
   console.log('\n[3/4] Employee signed ClaimRequest (EIP-712, offline)');
 
-  // ── [链上交互 2] Relayer 代发 claim ────────────────────────────────────────
-
+  // ── [链上交互 3] Relayer 代发 claim（relayerClient 发起）──────────────────
   console.log('[4/4] Relayer calling claim...');
-  const claimTx = await walletClient.writeContract({
+  const claimTx = await relayerClient.writeContract({
     address:      VAULT_ADDRESS,
     abi:          vaultArtifact.abi,
     functionName: 'claim',
@@ -185,7 +191,6 @@ async function main(): Promise<void> {
   console.log(`  tx: ${claimTx}`);
 
   // ── [验证] ─────────────────────────────────────────────────────────────────
-
   console.log('\n✅ Testnet E2E 完成！');
   console.log(`Sepolia Explorer: https://sepolia.etherscan.io/tx/${claimTx}`);
 }
