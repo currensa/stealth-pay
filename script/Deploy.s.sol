@@ -15,8 +15,8 @@ contract DeployScript is Script {
         // 1. 部署 Mock USDT
         ERC20Mock usdt = new ERC20Mock("Tether USD", "USDT");
 
-        // 2. 部署 StealthPayVault（deployer 为 Owner）
-        StealthPayVault vault = new StealthPayVault(deployer);
+        // 2. 部署 StealthPayVault（Permissionless，无 Owner）
+        StealthPayVault vault = new StealthPayVault();
 
         // 3. 给 deployer 铸造 1,000,000 枚 Mock USDT（18 位精度）
         usdt.mint(deployer, 1_000_000 * 10 ** 18);

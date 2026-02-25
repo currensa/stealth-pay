@@ -5,7 +5,7 @@ import "forge-std/Test.sol";
 import "../src/StealthPayVault.sol";
 
 // ---------------------------------------------------------------------------
-// Mock ERC-20（模拟 USDT）
+// Mock ERC-20（模拟 USDT / USDC）
 // ---------------------------------------------------------------------------
 
 contract MockUSDT {
@@ -52,7 +52,7 @@ contract StealthPayVaultTest is Test {
     // 测试角色
     // -----------------------------------------------------------------------
 
-    address internal hrAdmin;      // 企业 HR（Owner）：持有海量 USDT，拥有发薪权限
+    address internal hrAdmin;      // 默认 HR（Owner 语义已废弃，仅作默认发薪方）
     address internal relayerNode;  // 中继器节点：代发 Gas，调用 claim，无初始 USDT
     address internal employeeDest; // 员工最终真实收款地址（纯白板）
 
@@ -78,9 +78,8 @@ contract StealthPayVaultTest is Test {
         stealthPrivKey = uint256(keccak256("shadow-payroll-2026"));
         stealthAddr    = vm.addr(stealthPrivKey);
 
-        // hrAdmin 作为 Owner 部署 Vault
-        vm.prank(hrAdmin);
-        vault = new StealthPayVault(hrAdmin);
+        // 无主合约：无需传入 owner 参数
+        vault = new StealthPayVault();
 
         // 铸造充足 USDT 给 hrAdmin（覆盖 fuzz 上界 1e36），并给予 Vault 最大授权
         usdt = new MockUSDT();
@@ -144,20 +143,18 @@ contract StealthPayVaultTest is Test {
     // Happy Path
     // -----------------------------------------------------------------------
 
-    /// @notice depositForPayroll 将 root 置入 activeRoots，非 Owner 无法调用
+    /// @notice 任何人都可以调用 depositForPayroll，payrolls 记录正确
     function test_DepositForPayroll() public {
-        bytes32 root  = bytes32(uint256(1)); // 任意 root
+        bytes32 root  = bytes32(uint256(1));
         uint256 total = 3_000 ether;
 
-        // 非 Owner（relayerNode）→ revert
-        vm.prank(relayerNode);
-        vm.expectRevert();
-        vault.depositForPayroll(root, address(usdt), total);
-
-        // hrAdmin（Owner）→ 成功，activeRoots 置 true，资金进入 Vault
         _depositUSDT(root, total);
-        assertTrue(vault.activeRoots(root), "root should be active");
-        assertEq(usdt.balanceOf(address(vault)), total,   "vault should hold total");
+
+        // payrolls 映射应记录正确的 employer 与 token
+        (address emp, address tok,) = vault.payrolls(root);
+        assertEq(emp, hrAdmin,       "employer should be hrAdmin");
+        assertEq(tok, address(usdt), "token should be usdt");
+        assertEq(usdt.balanceOf(address(vault)), total, "vault should hold total");
     }
 
     /// @notice 完整 Merkle 发薪流程 + AlreadyClaimed 防双花
@@ -168,8 +165,8 @@ contract StealthPayVaultTest is Test {
         address stealthAddr2 = makeAddr("stealthAddr2");
         address recipient    = makeAddr("recipient");
 
-        uint256 amount1 = 1_000 ether; // leaf1 金额
-        uint256 amount2 = 2_000 ether; // leaf2 金额
+        uint256 amount1 = 1_000 ether;
+        uint256 amount2 = 2_000 ether;
         uint256 fee     =    10 ether;
 
         // ── 构造 2-叶 Merkle Tree ─────────────────────────────────────────────
@@ -177,14 +174,11 @@ contract StealthPayVaultTest is Test {
         bytes32 leaf2 = _leaf(stealthAddr2, address(usdt), amount2);
         bytes32 root  = _merkleRoot2(leaf1, leaf2);
 
-        // leaf1 的 proof = [leaf2]（唯一兄弟节点）
         bytes32[] memory proof1 = new bytes32[](1);
         proof1[0] = leaf2;
 
-        // ── hrAdmin：存入总额 ─────────────────────────────────────────────────
         _depositUSDT(root, amount1 + amount2);
 
-        // ── 构造 ClaimRequest 并签名（影子私钥 stealthPk1）──────────────────
         StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
             stealthAddress: stealthAddr1,
             token:          address(usdt),
@@ -195,22 +189,20 @@ contract StealthPayVaultTest is Test {
         });
         bytes memory sig = _signClaimRequest(req, stealthPk1);
 
-        // ── relayerNode 代发 ──────────────────────────────────────────────────
         vm.prank(relayerNode);
         vault.claim(req, sig, proof1, root);
 
-        // ── 断言余额与 isClaimed ───────────────────────────────────────────────
         assertEq(usdt.balanceOf(recipient),      amount1 - fee, "recipient should receive 990 ether");
         assertEq(usdt.balanceOf(relayerNode),    fee,           "relayerNode should receive 10 ether");
         assertTrue(vault.isClaimed(stealthAddr1),               "isClaimed should be true");
 
-        // ── 防双花：相同参数再次 claim → AlreadyClaimed ───────────────────────
+        // 防双花
         vm.prank(relayerNode);
         vm.expectRevert(abi.encodeWithSignature("AlreadyClaimed()"));
         vault.claim(req, sig, proof1, root);
     }
 
-    /// @notice 原生 ETH 完整发薪流程：depositForPayroll{value} → claim → ETH 余额精准到账
+    /// @notice 原生 ETH 完整发薪流程
     function test_NativeETH_Flow() public {
         uint256 stealthPk      = 0xA11CE;
         address stealthAddress = vm.addr(stealthPk);
@@ -219,23 +211,23 @@ contract StealthPayVaultTest is Test {
         uint256 amount = 1 ether;
         uint256 fee    = 0.01 ether;
 
-        // 单叶 Merkle，token = address(0) 代表原生 ETH
         bytes32 leaf           = _leaf(stealthAddress, address(0), amount);
         bytes32 root           = leaf;
         bytes32[] memory proof = new bytes32[](0);
 
-        // hrAdmin：vm.deal 补充 ETH，然后 depositForPayroll{value: amount}
         vm.deal(hrAdmin, amount);
         vm.prank(hrAdmin);
         vault.depositForPayroll{value: amount}(root, address(0), amount);
 
+        // payrolls 应记录 ETH 存款
+        (address ethEmp, address ethTok,) = vault.payrolls(root);
+        assertEq(ethEmp, hrAdmin,    "employer should be hrAdmin");
+        assertEq(ethTok, address(0), "token should be ETH");
         assertEq(address(vault).balance, amount, "vault should hold ETH");
-        assertTrue(vault.activeRoots(root), "root should be active");
 
-        // 员工：构造 ETH ClaimRequest 并签名
         StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
             stealthAddress: stealthAddress,
-            token:          address(0),   // 原生 ETH
+            token:          address(0),
             amount:         amount,
             recipient:      recipient,
             feeAmount:      fee,
@@ -243,15 +235,127 @@ contract StealthPayVaultTest is Test {
         });
         bytes memory sig = _signClaimRequest(req, stealthPk);
 
-        // relayerNode 代发 claim
         vm.prank(relayerNode);
         vault.claim(req, sig, proof, root);
 
-        // 断言：ETH 精准到账
         assertEq(address(recipient).balance,   amount - fee, "recipient should receive amount-fee ETH");
         assertEq(address(relayerNode).balance, fee,          "relayerNode should receive fee ETH");
-        assertEq(address(vault).balance,       0,            "vault should be empty after claim");
+        assertEq(address(vault).balance,       0,            "vault should be empty");
         assertTrue(vault.isClaimed(stealthAddress),          "isClaimed should be true");
+    }
+
+    // -----------------------------------------------------------------------
+    // 多租户测试
+    // -----------------------------------------------------------------------
+
+    /// @notice 两个 HR 各自存入不同代币，员工互不干扰，各自成功提款
+    function test_MultiTenant_Isolation() public {
+        address hrA = makeAddr("hrA");
+        address hrB = makeAddr("hrB");
+        MockUSDT usdc = new MockUSDT(); // 第二种代币（模拟 USDC）
+
+        uint256 amountA = 1_000 ether;
+        uint256 amountB = 2_000 ether;
+
+        // hrA 持有 USDT
+        usdt.mint(hrA, amountA);
+        vm.prank(hrA);
+        usdt.approve(address(vault), amountA);
+
+        // hrB 持有 USDC
+        usdc.mint(hrB, amountB);
+        vm.prank(hrB);
+        usdc.approve(address(vault), amountB);
+
+        uint256 stealthPkA   = 0xAAAA;
+        address stealthAddrA = vm.addr(stealthPkA);
+        uint256 stealthPkB   = 0xBBBB;
+        address stealthAddrB = vm.addr(stealthPkB);
+
+        // 构建各自单叶 Merkle 树
+        bytes32 rootA  = _leaf(stealthAddrA, address(usdt), amountA);
+        bytes32 rootB  = _leaf(stealthAddrB, address(usdc), amountB);
+        bytes32[] memory emptyProof = new bytes32[](0);
+
+        // hrA 存入 USDT，hrB 存入 USDC
+        vm.prank(hrA);
+        vault.depositForPayroll(rootA, address(usdt), amountA);
+        vm.prank(hrB);
+        vault.depositForPayroll(rootB, address(usdc), amountB);
+
+        // payrolls 隔离验证
+        (address empA, address tokA,) = vault.payrolls(rootA);
+        (address empB, address tokB,) = vault.payrolls(rootB);
+        assertEq(empA, hrA,           "rootA employer = hrA");
+        assertEq(tokA, address(usdt), "rootA token = USDT");
+        assertEq(empB, hrB,           "rootB employer = hrB");
+        assertEq(tokB, address(usdc), "rootB token = USDC");
+
+        address recipientA = makeAddr("recipientA");
+        address recipientB = makeAddr("recipientB");
+
+        // 员工 A 提取 USDT
+        StealthPayVault.ClaimRequest memory reqA = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddrA,
+            token:          address(usdt),
+            amount:         amountA,
+            recipient:      recipientA,
+            feeAmount:      0,
+            deadline:       block.timestamp + 1 hours
+        });
+        vm.prank(relayerNode);
+        vault.claim(reqA, _signClaimRequest(reqA, stealthPkA), emptyProof, rootA);
+        assertEq(usdt.balanceOf(recipientA), amountA, "A should receive USDT");
+
+        // 员工 B 提取 USDC
+        StealthPayVault.ClaimRequest memory reqB = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddrB,
+            token:          address(usdc),
+            amount:         amountB,
+            recipient:      recipientB,
+            feeAmount:      0,
+            deadline:       block.timestamp + 1 hours
+        });
+        vm.prank(relayerNode);
+        vault.claim(reqB, _signClaimRequest(reqB, stealthPkB), emptyProof, rootB);
+        assertEq(usdc.balanceOf(recipientB), amountB, "B should receive USDC");
+    }
+
+    /// @notice 拿 USDT root 的 Proof 却请求提取 USDC → TokenMismatch
+    function test_RevertIf_CrossTenantTokenAttack() public {
+        address hrA = makeAddr("hrA");
+        MockUSDT usdc = new MockUSDT(); // 另一个 HR 的代币
+
+        uint256 amountA = 1_000 ether;
+        usdt.mint(hrA, amountA);
+        vm.prank(hrA);
+        usdt.approve(address(vault), amountA);
+
+        uint256 stealthPkA   = 0xAAAA;
+        address stealthAddrA = vm.addr(stealthPkA);
+
+        bytes32 rootA  = _leaf(stealthAddrA, address(usdt), amountA);
+        bytes32[] memory proofA = new bytes32[](0);
+
+        vm.prank(hrA);
+        vault.depositForPayroll(rootA, address(usdt), amountA);
+
+        // 攻击：拿 rootA（USDT root）但篡改 req.token 为 USDC
+        StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddrA,
+            token:          address(usdc), // 企图提取 USDC
+            amount:         amountA,
+            recipient:      makeAddr("attacker"),
+            feeAmount:      0,
+            deadline:       block.timestamp + 1 hours
+        });
+        // 签名必须在 vm.expectRevert 之前计算，否则内部的 vault.CLAIM_TYPEHASH() staticcall
+        // 会被 vm.expectRevert 拦截，导致误判
+        bytes memory attackSig = _signClaimRequest(req, stealthPkA);
+
+        vm.prank(relayerNode);
+        vm.expectRevert(abi.encodeWithSignature("TokenMismatch()"));
+        vault.claim(req, attackSig, proofA, rootA);
     }
 
     // -----------------------------------------------------------------------
@@ -263,14 +367,13 @@ contract StealthPayVaultTest is Test {
         uint256 stealthPk      = 0xA11CE;
         address stealthAddress = vm.addr(stealthPk);
 
-        // 单叶 Merkle（root = leaf，proof = []）
         bytes32 leaf           = _leaf(stealthAddress, address(usdt), 500 ether);
         bytes32 root           = leaf;
         bytes32[] memory proof = new bytes32[](0);
 
         _depositUSDT(root, 500 ether);
 
-        vm.warp(block.timestamp + 2 hours); // 快进时间
+        vm.warp(block.timestamp + 2 hours);
 
         StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
             stealthAddress: stealthAddress,
@@ -278,7 +381,7 @@ contract StealthPayVaultTest is Test {
             amount:         500 ether,
             recipient:      employeeDest,
             feeAmount:      0,
-            deadline:       block.timestamp - 1 // 已过期
+            deadline:       block.timestamp - 1
         });
         bytes memory sig = _signClaimRequest(req, stealthPk);
 
@@ -310,13 +413,13 @@ contract StealthPayVaultTest is Test {
         });
         bytes memory sig = _signClaimRequest(req, stealthPk);
 
-        // 场景 A：篡改 amount → 叶子哈希不匹配 proof → InvalidMerkleProof
+        // 场景 A：篡改 amount → InvalidMerkleProof
         req.amount = 9_999 ether;
         vm.prank(relayerNode);
         vm.expectRevert(abi.encodeWithSignature("InvalidMerkleProof()"));
         vault.claim(req, sig, proof, root);
 
-        // 场景 B：恢复 amount，篡改 recipient → Merkle 通过，EIP-712 不匹配 → InvalidSignature
+        // 场景 B：恢复 amount，篡改 recipient → InvalidSignature
         req.amount    = legitimateAmount;
         req.recipient = hacker;
         vm.prank(relayerNode);
@@ -346,14 +449,13 @@ contract StealthPayVaultTest is Test {
         });
         bytes memory sig = _signClaimRequest(req, stealthPk);
 
-        // Merkle leaf 不含 feeAmount → Merkle 通过；EIP-712 不匹配 → InvalidSignature
         req.feeAmount = 1_000 ether;
         vm.prank(relayerNode);
         vm.expectRevert(abi.encodeWithSignature("InvalidSignature()"));
         vault.claim(req, sig, proof, root);
     }
 
-    /// @notice 提交不在 activeRoots 中的 root → InvalidRoot
+    /// @notice 提交不在 payrolls 中的 root → InvalidRoot
     function test_RevertIf_InvalidRoot() public {
         bytes32 unknownRoot    = bytes32(uint256(0xDEADBEEF));
         bytes32[] memory proof = new bytes32[](0);
@@ -373,7 +475,7 @@ contract StealthPayVaultTest is Test {
         vault.claim(req, sig, proof, unknownRoot);
     }
 
-    /// @notice 错误的 Merkle Proof（2 叶树只提供空 proof）→ InvalidMerkleProof
+    /// @notice 错误的 Merkle Proof → InvalidMerkleProof
     function test_RevertIf_InvalidMerkleProof() public {
         uint256 stealthPk      = 0xA11CE;
         address stealthAddress = vm.addr(stealthPk);
@@ -384,10 +486,9 @@ contract StealthPayVaultTest is Test {
         bytes32 leaf2  = _leaf(stealthAddr2,   address(usdt), amount);
         bytes32 root   = _merkleRoot2(leaf1, leaf2);
 
-        // 存入 2 倍总额
         _depositUSDT(root, 2 * amount);
 
-        bytes32[] memory emptyProof = new bytes32[](0); // 刻意用错误的空 proof
+        bytes32[] memory emptyProof = new bytes32[](0);
 
         StealthPayVault.ClaimRequest memory req = StealthPayVault.ClaimRequest({
             stealthAddress: stealthAddress,
@@ -404,7 +505,7 @@ contract StealthPayVaultTest is Test {
         vault.claim(req, sig, emptyProof, root);
     }
 
-    /// @notice high-s 签名被 OZ ECDSA 库拦截（ECDSAInvalidSignatureS）
+    /// @notice high-s 签名被 OZ ECDSA 库拦截
     function test_RevertIf_SignatureMalleability() public {
         uint256 stealthPk      = 0xA11CE;
         address stealthAddress = vm.addr(stealthPk);
@@ -425,7 +526,6 @@ contract StealthPayVaultTest is Test {
             deadline:       block.timestamp + 1 hours
         });
 
-        // 在块作用域内构造 high-s 签名，避免 stack too deep
         bytes memory malleatedSig;
         {
             bytes32 structHash = keccak256(abi.encode(
@@ -443,15 +543,12 @@ contract StealthPayVaultTest is Test {
                 structHash
             ));
             (uint8 v, bytes32 r, bytes32 s) = vm.sign(stealthPk, digest);
-
-            // high-s 变体：s2 = N - s（必然 > N/2），v 翻转
             uint256 N  = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;
             bytes32 s2 = bytes32(N - uint256(s));
             uint8   v2 = v == 27 ? 28 : 27;
             malleatedSig = abi.encodePacked(r, s2, v2);
         }
 
-        // OZ ECDSA.recover 遇到 high-s 会 revert(ECDSAInvalidSignatureS)
         vm.prank(relayerNode);
         vm.expectRevert();
         vault.claim(req, malleatedSig, proof, root);
@@ -461,7 +558,6 @@ contract StealthPayVaultTest is Test {
     // 模糊测试 & Gas 测试
     // -----------------------------------------------------------------------
 
-    /// @notice 单叶 Merkle（root = leaf，proof = []）的随机金额全流程测试
     function testFuzz_AllocationAndClaim(uint256 amount, uint256 feeAmount) public {
         vm.assume(amount > 0 && amount < 1e36);
         vm.assume(feeAmount <= amount);
@@ -470,7 +566,6 @@ contract StealthPayVaultTest is Test {
         address stealthAddress = vm.addr(stealthPk);
         address recip          = makeAddr("fuzz_recipient");
 
-        // 单叶 Merkle：root = leaf，proof = []
         bytes32 leaf           = _leaf(stealthAddress, address(usdt), amount);
         bytes32 root           = leaf;
         bytes32[] memory proof = new bytes32[](0);
@@ -494,7 +589,6 @@ contract StealthPayVaultTest is Test {
         assertEq(usdt.balanceOf(relayerNode),  feeAmount,          "relayerNode fee mismatch");
     }
 
-    /// @notice Merkle 版 claim 的 Gas 基准
     function test_GasCost_Claim() public {
         uint256 stealthPk      = 0xA11CE;
         address stealthAddress = vm.addr(stealthPk);
