@@ -1,6 +1,6 @@
 # StealthPay — 企业级隐私发薪系统
 
-> **版本：** v2.1 (Sepolia 就绪) | **框架：** Foundry + TypeScript SDK | **网络：** EVM 兼容链（已验证 Sepolia）
+> **版本：** v2.2 (Sepolia 已验证) | **框架：** Foundry + TypeScript SDK | **网络：** EVM 兼容链（已验证 Sepolia）
 
 在 Web3 企业和 DAO 的日常运营中，"链上发薪"存在严重的隐私泄露问题：通过区块链浏览器可以轻易推导出公司的**完整员工名单**和**内部薪资结构**。StealthPay 通过 ECDH 隐身地址 + Merkle Tree + EIP-712 中继提取的组合，在隐私保护、Gas 成本与用户体验之间取得平衡。
 
@@ -232,18 +232,19 @@ npm test test/e2e.integration.test.ts
 
 ```bash
 # 1. 部署合约（记录输出的两个地址）
-PRIVATE_KEY=0x... forge script script/Deploy.s.sol \
-  --rpc-url $SEPOLIA_RPC_URL --broadcast --verify \
-  --etherscan-api-key $ETHERSCAN_KEY
+source .env && forge script script/Deploy.s.sol:DeployScript \
+  --rpc-url $SEPOLIA_RPC_URL --broadcast
 
-# 2. 在 sdk/scripts/testnet-e2e.ts 中填入部署后的合约地址
-#    VAULT_ADDRESS = '0x...'
-#    USDT_ADDRESS  = '0x...'
+# 2. 创建 sdk/.env（HR 与 Relayer 使用独立私钥）
+cat > sdk/.env <<EOF
+SEPOLIA_RPC_URL="https://..."
+HR_PRIVATE_KEY="0x..."
+RELAYER_PRIVATE_KEY="0x..."
+VAULT_ADDRESS="0x..."   # 步骤 1 部署后打印的地址
+USDT_ADDRESS="0x..."    # 步骤 1 部署后打印的地址
+EOF
 
-# 3. 创建 sdk/.env
-echo "PRIVATE_KEY=0x...\nSEPOLIA_RPC_URL=https://..." > sdk/.env
-
-# 4. 运行全链路脚本
+# 3. 运行全链路脚本
 cd sdk && npm run run:testnet
 ```
 
@@ -252,6 +253,8 @@ cd sdk && npm run run:testnet
 ## 七、测试覆盖
 
 ### Foundry（合约）
+
+测试角色：`hrAdmin`（Owner，持有 USDT，发起 deposit）/ `relayerNode`（调用 claim）/ `employeeDest`（最终收款）
 
 | 测试 | 类型 | 验证内容 |
 |------|------|---------|
@@ -278,11 +281,11 @@ cd sdk && npm run run:testnet
 
 ### Sepolia 全链路脚本
 
-`sdk/scripts/testnet-e2e.ts` 在真实测试网上跑通完整发薪流程：
-- 读取 `.env` 中的 `PRIVATE_KEY` + `SEPOLIA_RPC_URL`
-- 调用 `computeStealthAddress` 生成影子地址
-- `StandardMerkleTree.of` 构建 Merkle 树
-- `depositForPayroll` → EIP-712 签名 → `claim`
+`sdk/scripts/testnet-e2e.ts` 在真实测试网上跑通完整发薪流程（已在 Sepolia 验证）：
+- 读取 `sdk/.env` 中的 `HR_PRIVATE_KEY` + `RELAYER_PRIVATE_KEY` + `SEPOLIA_RPC_URL`
+- 实例化 `hrClient`（approve + depositForPayroll）与 `relayerClient`（claim）
+- `computeStealthAddress` 生成影子地址 → `StandardMerkleTree.of` 构建 Merkle 树
+- `depositForPayroll` → EIP-712 本地签名 → `claim`
 - 打印 Sepolia Etherscan 链接
 
 ---

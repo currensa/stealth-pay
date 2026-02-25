@@ -618,13 +618,136 @@ forge build: Compiler run successful!（5 个文件）
 
 ---
 
+---
+
+## 阶段 14：Sepolia 测试网首次上链验证
+
+### 目标
+将完整发薪流程部署并运行在真实的 Sepolia 测试网，验证合约与 SDK 在链上的端到端可用性。
+
+### 前置配置修复
+在执行部署前，发现根目录 `.env` 存在两个配置错误：
+
+| 问题 | 原值 | 修正值 |
+|------|------|--------|
+| `SEPOLIA_RPC_URL` 缺少协议头 | `eth-sepolia.g.alchemy.com/...` | `https://eth-sepolia.g.alchemy.com/...` |
+| `PRIVATE_KEY` 缺少 `0x` 前缀 | `f9988c31...` | `0xf9988c31...` |
+
+`Deploy.s.sol` 使用 `vm.envUint("PRIVATE_KEY")` 读取私钥，该函数需要 `0x` 前缀才能正确解析十六进制；`viem` 的 `privateKeyToAccount` 同理。
+
+同时创建 `sdk/.env`（`testnet-e2e.ts` 使用 `import 'dotenv/config'` 从脚本运行目录加载，而非项目根目录）。
+
+### 部署
+
+```bash
+source .env && forge script script/Deploy.s.sol:DeployScript \
+  --rpc-url $SEPOLIA_RPC_URL --broadcast
+```
+
+部署产物（Sepolia）：
+- `ERC20Mock (USDT)` : `0x36Beb3D00ca469BC61d8521eb6Dc804F6Ba7E9D6`
+- `StealthPayVault`  : `0x96da8F41A85382b607E84982D398110E2C3f89a7`
+- `Deployer (Owner)` : `0xeb310f47111a9E5DB4b66C0E3A4C5d8F31E99189`
+
+合约地址通过环境变量管理（`sdk/.env` 中的 `VAULT_ADDRESS` / `USDT_ADDRESS`），不硬编码进代码；`broadcast/` 目录加入 `.gitignore`，防止交易日志泄露。
+
+### 全链路运行结果
+
+```
+=== StealthPay Sepolia E2E ===
+Deployer / HR / Relayer : 0xeb310f47111a9E5DB4b66C0E3A4C5d8F31E99189
+Vault                   : 0x96da8F41A85382b607E84982D398110E2C3f89a7
+Mock USDT               : 0x36Beb3D00ca469BC61d8521eb6Dc804F6Ba7E9D6
+
+Stealth address         : 0xb53d1b56ead22ecb07395e585eb52b29fb30c80a
+Merkle root             : 0x2d78826de1004a791ebdfb2f99be1b8a3e5f6ba79863db0af2c57c396c407220
+
+[1/4] Approving Mock USDT to Vault...        tx: 0xf07569...
+[2/4] depositForPayroll...                   tx: 0x3cdbee...
+[3/4] Employee signed ClaimRequest (EIP-712, offline)
+[4/4] Relayer calling claim...               tx: 0x7977cc...
+
+✅ Testnet E2E 完成！
+```
+
+4 笔交易全部上链，隐私发薪全链路在 Sepolia 首次验证通过。
+
+---
+
+## 阶段 15：物理角色隔离重构
+
+### 动机
+原有测试与 E2E 脚本存在角色混用问题：
+- Foundry 测试中 `owner`、`relayer`、`employee` 语义不够明确，`_depositUSDT` 辅助函数内部自行铸币，未反映真实的角色职责边界
+- `testnet-e2e.ts` 使用单一 `PRIVATE_KEY` 同时扮演 HR、Relayer 两个角色，一个 `walletClient` 发起所有链上操作
+
+### Foundry 测试重构（`test/StealthPayVault.t.sol`）
+
+**角色重命名：**
+
+| 旧变量 | 新变量 | 职责定义 |
+|--------|--------|---------|
+| `owner` | `hrAdmin` | Vault Owner，持有海量 USDT，拥有发薪权限 |
+| `relayer` | `relayerNode` | 中继器节点，唯一调用 `claim()`，无初始 USDT |
+| `employee` | `employeeDest` | 员工最终收款地址，纯白板 |
+
+**`setUp()` 职责集中化：**
+```solidity
+// 新 setUp：铸币与授权统一完成，覆盖 fuzz 上界
+usdt.mint(hrAdmin, 1e36);
+vm.prank(hrAdmin);
+usdt.approve(address(vault), type(uint256).max);
+```
+
+**`_depositUSDT` 精简：**
+```solidity
+// 旧：内部自行 mint + approve + deposit（职责越界）
+// 新：只负责 prank + depositForPayroll
+function _depositUSDT(bytes32 root, uint256 totalAmount) internal {
+    vm.prank(hrAdmin);
+    vault.depositForPayroll(root, address(usdt), totalAmount);
+}
+```
+
+**验证 GREEN：**
+```
+Ran 11 tests for test/StealthPayVault.t.sol:StealthPayVaultTest
+[PASS] testFuzz_AllocationAndClaim(uint256,uint256) (runs: 256)
+... 11 passed; 0 failed
+```
+
+### TypeScript E2E 重构（`sdk/scripts/testnet-e2e.ts`）
+
+**环境变量拆分：**
+
+| 旧 | 新 |
+|----|----|
+| `PRIVATE_KEY` | `HR_PRIVATE_KEY` + `RELAYER_PRIVATE_KEY` |
+
+**双 Client 架构：**
+```typescript
+const hrClient      = createWalletClient({ account: hrAccount, ... });
+const relayerClient = createWalletClient({ account: relayerAccount, ... });
+```
+
+**调用主体绑定：**
+
+| 步骤 | 操作 | 发起方 |
+|------|------|--------|
+| 1/4 | approve USDT | `hrClient` |
+| 2/4 | depositForPayroll | `hrClient` |
+| 3/4 | EIP-712 签名 | `stealthAccount`（纯本地，无 gas） |
+| 4/4 | claim | `relayerClient` |
+
+---
+
 ## 最终状态总览
 
 | 层 | 文件 | 测试数 | 状态 |
 |----|------|--------|------|
 | 合约 | `src/StealthPayVault.sol` | 11（含 256 轮 fuzz） | ✅ 全绿 |
 | 合约 Mock | `src/mocks/ERC20Mock.sol` | — | ✅ 编译通过 |
-| 部署脚本 | `script/Deploy.s.sol` | — | ✅ 编译通过 |
+| 部署脚本 | `script/Deploy.s.sol` | — | ✅ Sepolia 已部署 |
 | SDK | `sdk/src/StealthKey.ts` | 3 | ✅ 全绿 |
 | 本地 E2E | `sdk/test/e2e.integration.test.ts` | 1 | ✅ 全绿（Anvil） |
-| 测试网脚本 | `sdk/scripts/testnet-e2e.ts` | — | ✅ 已就绪（Sepolia） |
+| 测试网脚本 | `sdk/scripts/testnet-e2e.ts` | — | ✅ Sepolia 全链路验证通过 |
