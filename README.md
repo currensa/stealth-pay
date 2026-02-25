@@ -1,6 +1,6 @@
 # StealthPay — 企业级隐私发薪系统
 
-> **版本：** v2.2 (Sepolia 已验证) | **框架：** Foundry + TypeScript SDK | **网络：** EVM 兼容链（已验证 Sepolia）
+> **版本：** v3.0 (多租户 SaaS 架构) | **框架：** Foundry + TypeScript SDK | **网络：** EVM 兼容链（已验证 Sepolia）
 
 在 Web3 企业和 DAO 的日常运营中，"链上发薪"存在严重的隐私泄露问题：通过区块链浏览器可以轻易推导出公司的**完整员工名单**和**内部薪资结构**。StealthPay 通过 ECDH 隐身地址 + Merkle Tree + EIP-712 中继提取的组合，在隐私保护、Gas 成本与用户体验之间取得平衡。
 
@@ -14,6 +14,7 @@
 | **冷启动无感提取** | 员工签名，Relayer 垫付 Gas，影子地址无需持有 ETH |
 | **全资产兼容** | 原生支持 ERC-20（USDT/USDC）与 Native ETH |
 | **企业自托管** | 资金由企业智能合约绝对控制，无外部混币依赖 |
+| **多租户隔离** | 单一合约服务多个企业，每笔发薪与发起方、代币严格绑定，跨企业攻击被合约层拦截 |
 
 ---
 
@@ -36,15 +37,17 @@
 ┌──────────────────────────▼──────────────────────────────────┐
 │                   StealthPayVault（链上）                    │
 │                                                             │
-│  depositForPayroll(merkleRoot, token, total)                │
-│    activeRoots[root] = true                                 │
+│  depositForPayroll(merkleRoot, token, total)  [Permissionless] │
+│    payrolls[root] = PayrollRecord(msg.sender, token, total) │
 │                                                             │
 │  claim(req, sig, merkleProof[], root)                       │
 │    ① deadline ② isClaimed ③ fee ≤ amount                   │
-│    ④ activeRoots[root] ⑤ MerkleProof.verify               │
-│    ⑥ ECDSA.recover == stealthAddress                       │
-│    ⑦ isClaimed[stealth] = true                             │
-│    ⑧ transfer(recipient, net) + transfer(relayer, fee)     │
+│    ④ payrolls[root].employer != 0                          │
+│    ⑤ req.token == payrolls[root].token  ← 跨租户防护       │
+│    ⑥ MerkleProof.verify                                    │
+│    ⑦ ECDSA.recover == stealthAddress                       │
+│    ⑧ isClaimed[stealth] = true                             │
+│    ⑨ transfer(recipient, net) + transfer(relayer, fee)     │
 └──────────────────────────┬──────────────────────────────────┘
                            │
               recipient ←──┘← net
@@ -94,23 +97,30 @@ stealth-pay/
 
 ## 四、智能合约接口
 
-### 状态变量
+### 状态变量与结构体
 
 ```solidity
-mapping(bytes32 => bool) public activeRoots;   // 合法发薪 Root 集合
-mapping(address => bool) public isClaimed;     // 影子地址是否已提款
-bytes32 public constant CLAIM_TYPEHASH;        // EIP-712 类型哈希
-bytes32 public immutable DOMAIN_SEPARATOR;     // 链 ID + 合约地址绑定
+// 每个 Merkle Root 绑定的发薪上下文（employer==address(0) 表示未注册）
+struct PayrollRecord {
+    address employer;    // 发薪方地址（调用 depositForPayroll 的 HR）
+    address token;       // 本批薪资代币（address(0) = ETH）
+    uint256 totalAmount; // 存入总额
+}
+
+mapping(bytes32 => PayrollRecord) public payrolls; // root → 发薪记录
+mapping(address => bool) public isClaimed;         // 影子地址是否已提款
+bytes32 public constant CLAIM_TYPEHASH;            // EIP-712 类型哈希
+bytes32 public immutable DOMAIN_SEPARATOR;         // 链 ID + 合约地址绑定
 ```
 
-### 发薪（仅 Owner）
+### 发薪（Permissionless，任何 HR 均可调用）
 
 ```solidity
 function depositForPayroll(
     bytes32 merkleRoot,   // 本期所有叶子构成的树根
     address token,        // 代币地址（address(0) = ETH）
     uint256 totalAmount   // 本期总发薪额
-) external payable onlyOwner;
+) external payable;
 ```
 
 ### 提款（Relayer 代发）
@@ -147,7 +157,8 @@ bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(stealthAddress, token
 | `SignatureExpired()` | `block.timestamp > req.deadline` |
 | `AlreadyClaimed()` | `isClaimed[stealthAddress] == true` |
 | `FeeExceedsAmount()` | `feeAmount > amount` |
-| `InvalidRoot()` | `root` 不在 `activeRoots` |
+| `InvalidRoot()` | `payrolls[root].employer == address(0)`（root 未注册） |
+| `TokenMismatch()` | `req.token != payrolls[root].token`（跨租户代币攻击） |
 | `InvalidMerkleProof()` | Merkle 路径验证失败 |
 | `InvalidSignature()` | EIP-712 恢复地址不匹配 |
 | `EthAmountMismatch()` | ETH 存款金额与参数不符 |
@@ -254,21 +265,23 @@ cd sdk && npm run run:testnet
 
 ### Foundry（合约）
 
-测试角色：`hrAdmin`（Owner，持有 USDT，发起 deposit）/ `relayerNode`（调用 claim）/ `employeeDest`（最终收款）
+测试角色：`hrAdmin`（默认发薪方，持有 USDT）/ `relayerNode`（调用 claim）/ `employeeDest`（最终收款）
 
 | 测试 | 类型 | 验证内容 |
 |------|------|---------|
-| `test_DepositForPayroll` | 正常流程 | 存款后 `activeRoots[root] = true`，非 Owner 被拒 |
+| `test_DepositForPayroll` | 正常流程 | 任意地址可存款，`payrolls` 记录正确的 employer 与 token |
 | `test_ClaimWithValidSignature` | 正常流程 | 2-叶 Merkle + EIP-712 完整提款 + AlreadyClaimed 防双花 |
+| `test_NativeETH_Flow` | 正常流程 | ETH 完整发薪+提款，vault 余额清零，payrolls 记录 ETH |
+| `test_MultiTenant_Isolation` | 多租户 | hrA(USDT)+hrB(USDC) 各自存款，员工互不干扰独立提款 |
+| `test_RevertIf_CrossTenantTokenAttack` | 安全边界 | 拿 USDT root 的 proof 请求提 USDC → `TokenMismatch()` |
 | `test_RevertIf_ExpiredDeadline` | 安全边界 | 过期签名被 `SignatureExpired()` 拦截 |
 | `test_RevertIf_TamperedPayload` | 安全边界 | 篡改 amount → `InvalidMerkleProof`；篡改 recipient → `InvalidSignature` |
 | `test_RevertIf_WrongSigner` | 安全边界 | 篡改 feeAmount → EIP-712 签名不匹配 |
 | `test_RevertIf_InvalidRoot` | 安全边界 | 未注册 root → `InvalidRoot()` |
 | `test_RevertIf_InvalidMerkleProof` | 安全边界 | 错误 proof → `InvalidMerkleProof()` |
-| `test_NativeETH_Flow` | 正常流程 | ETH 完整发薪+提款，vault 余额清零 |
 | `test_RevertIf_SignatureMalleability` | 安全边界 | high-s 签名被 OZ ECDSA 拦截 |
 | `testFuzz_AllocationAndClaim` | 模糊测试 | 256 轮随机金额，单叶退化树（root=leaf） |
-| `test_GasCost_Claim` | Gas 基准 | Merkle claim gas: ~192,036 |
+| `test_GasCost_Claim` | Gas 基准 | Merkle claim gas 基准测量 |
 
 ### SDK（TypeScript）
 
@@ -294,11 +307,14 @@ cd sdk && npm run run:testnet
 
 **claim 检查顺序（防信息泄露）：**
 ```
-deadline → isClaimed → feeAmount ≤ amount → activeRoots[root]
+deadline → isClaimed → feeAmount ≤ amount
+→ payrolls[root].employer != 0
+→ req.token == payrolls[root].token  ← 跨租户防护
 → MerkleProof.verify → ECDSA.recover → isClaimed=true → 转账
 ```
 
 **关键安全属性：**
+- `TokenMismatch`：每个 root 绑定特定代币，防止用 A 企业 root 提取 B 企业资产
 - Merkle Proof 和签名验证均在状态变更前完成（CEI 模式）
 - `isClaimed` 替代 `nonces`：每个影子地址全生命周期只能提款一次
 - OZ `ECDSA.recover`：自动防签名延展性（high-s 值）
@@ -330,12 +346,12 @@ PRIVATE_KEY=$YOUR_KEY forge script script/Deploy.s.sol \
 === Deployment Complete ===
 ERC20Mock (USDT) : 0x...
 StealthPayVault  : 0x...
-Deployer (Owner) : 0x...
+Deployer         : 0x...
 Minted 1,000,000 USDT to deployer.
 ```
 
-`PRIVATE_KEY` 持有者自动成为合约 Owner（生产环境建议替换为企业多签地址）。
+合约无 Owner，部署后任何 HR 地址均可直接调用 `depositForPayroll` 发薪。
 
 ---
 
-> 完整开发过程（13 个阶段）详见 [DEVLOG.md](./DEVLOG.md)。
+> 完整开发过程（16 个阶段）详见 [DEVLOG.md](./DEVLOG.md)。

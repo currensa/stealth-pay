@@ -741,11 +741,135 @@ const relayerClient = createWalletClient({ account: relayerAccount, ... });
 
 ---
 
+---
+
+## 阶段 16：多租户 SaaS 架构升级（v3.0）
+
+### 动机
+原有合约依赖 `Ownable`，仅 Owner 可调用 `depositForPayroll`，限制了 SaaS 扩展性。目标：升级为 Permissionless 多租户平台——任何企业（HR）均可自主存入薪资，同一合约服务多个企业，跨租户攻击在合约层拦截。
+
+### 架构变更
+
+| 方面 | 旧方案 | 新方案（v3.0） |
+|------|--------|---------------|
+| 权限模型 | `Ownable`，`depositForPayroll` 限 Owner | Permissionless，任意地址可成为 Employer |
+| 状态变量 | `mapping(bytes32 => bool) activeRoots` | `mapping(bytes32 => PayrollRecord) payrolls` |
+| Root 绑定 | 仅记录是否存在 | 绑定 `(employer, token, totalAmount)` 三元组 |
+| 跨租户防护 | 无 | `req.token != payrolls[root].token → TokenMismatch()` |
+| claim 步骤 | 8 步 | 9 步（新增步骤 5：token 一致性检查） |
+
+### TDD 流程
+
+#### RED（测试先行）
+
+**新增测试：**
+
+1. **`test_MultiTenant_Isolation`**：hrA 以 USDT 存款，hrB 以独立部署的 USDC 存款，双方员工各自持有正确 Merkle Proof，独立完成提款，互不干扰，断言各自余额精准到账。
+
+2. **`test_RevertIf_CrossTenantTokenAttack`**：攻击者持有 hrA（USDT）Merkle Root 的有效 Proof，但将 `req.token` 篡改为 USDC，期望合约抛出 `TokenMismatch()`。
+
+**修改测试：**
+- `setUp()`：`new StealthPayVault()` 无参数构造（移除 Owner 地址）
+- `test_DepositForPayroll`、`test_NativeETH_Flow`：从 `vault.activeRoots(root)` 改为 `vault.payrolls(root)` 结构体访问
+
+#### GREEN（合约重构）
+
+**移除：**
+```solidity
+// import "@openzeppelin/contracts/access/Ownable.sol";
+// contract StealthPayVault is ReentrancyGuard, Ownable
+// constructor(address initialOwner) Ownable(initialOwner)
+// modifier onlyOwner on depositForPayroll
+// mapping(bytes32 => bool) public activeRoots;
+```
+
+**新增：**
+```solidity
+struct PayrollRecord {
+    address employer;    // 调用 depositForPayroll 的 HR 地址
+    address token;       // 本批薪资代币（address(0) = ETH）
+    uint256 totalAmount; // 存入总额
+}
+
+mapping(bytes32 => PayrollRecord) public payrolls;
+
+error TokenMismatch(); // 请求代币与 root 绑定代币不一致（跨租户攻击防护）
+```
+
+**`depositForPayroll` 变更：**
+```solidity
+// 旧：onlyOwner，activeRoots[merkleRoot] = true
+// 新：Permissionless，payrolls[merkleRoot] = PayrollRecord(msg.sender, token, totalAmount)
+```
+
+**`claim` 检查顺序（新增第 5 步）：**
+```
+deadline → isClaimed → fee ≤ amount → payrolls[root].employer != 0
+→ req.token == payrolls[root].token  ← TokenMismatch（新增）
+→ MerkleProof.verify → ECDSA.recover → isClaimed=true → 转账
+```
+
+#### 调试记录（遇到的坑）
+
+**问题 1：Deploy.s.sol 构造参数未同步**
+```
+Error: wrong number of arguments for constructor
+```
+`script/Deploy.s.sol` 仍使用 `new StealthPayVault(deployer)`。移除 `Ownable` 后构造函数无参数，修复为 `new StealthPayVault()`。
+
+**问题 2：Solidity 结构体 public getter 返回 tuple**
+```
+TypeError: Member "employer" not found in tuple(address,address,uint256)
+```
+Solidity 的 `public mapping(bytes32 => struct)` getter 返回的是位置元组，不能用 `.employer` 点访问。修复方式：
+```solidity
+// 错误：vault.payrolls(root).employer
+// 正确：
+(address emp, address tok,) = vault.payrolls(root);
+```
+
+**问题 3：Stack too deep（`test_MultiTenant_Isolation`）**
+测试函数局部变量过多（hrA/hrB 各自的 stealth 密钥、证明路径、客户端等），导致 EVM 栈深度超出 16 的限制。
+修复：在 `foundry.toml` 添加 `via_ir = true`（启用 Yul 中间代码，消除栈深度限制，代价是编译速度略慢）。
+
+**问题 4：`vm.expectRevert` 拦截了 `vault.CLAIM_TYPEHASH()` staticcall**
+`test_RevertIf_CrossTenantTokenAttack` 中，`_signClaimRequest` 辅助函数内部调用 `vault.CLAIM_TYPEHASH()` 来读取类型哈希。`vm.expectRevert` 挂钩的是"下一个外部调用"，导致它拦截了这个 staticcall 而非真正的 `vault.claim()` 调用，测试永远失败。
+修复：将签名计算移至 `vm.expectRevert` 调用之前：
+```solidity
+// 先预计算签名
+bytes memory attackSig = _signClaimRequest(req, stealthPkA);
+// 再设置 expectRevert，然后调用 claim
+vm.expectRevert(StealthPayVault.TokenMismatch.selector);
+vault.claim(req, attackSig, proofA, rootA);
+```
+
+#### 验证 GREEN
+
+```
+Ran 13 tests for test/StealthPayVault.t.sol:StealthPayVaultTest
+[PASS] testFuzz_AllocationAndClaim(uint256,uint256) (runs: 256)
+[PASS] test_ClaimWithValidSignature()
+[PASS] test_DepositForPayroll()
+[PASS] test_GasCost_Claim()
+[PASS] test_MultiTenant_Isolation()              ✅ 新增
+[PASS] test_NativeETH_Flow()
+[PASS] test_RevertIf_CrossTenantTokenAttack()    ✅ 新增
+[PASS] test_RevertIf_ExpiredDeadline()
+[PASS] test_RevertIf_InvalidMerkleProof()
+[PASS] test_RevertIf_InvalidRoot()
+[PASS] test_RevertIf_SignatureMalleability()
+[PASS] test_RevertIf_TamperedPayload()
+[PASS] test_RevertIf_WrongSigner()
+13 passed; 0 failed
+```
+
+---
+
 ## 最终状态总览
 
 | 层 | 文件 | 测试数 | 状态 |
 |----|------|--------|------|
-| 合约 | `src/StealthPayVault.sol` | 11（含 256 轮 fuzz） | ✅ 全绿 |
+| 合约 | `src/StealthPayVault.sol` | 13（含 256 轮 fuzz） | ✅ 全绿 |
 | 合约 Mock | `src/mocks/ERC20Mock.sol` | — | ✅ 编译通过 |
 | 部署脚本 | `script/Deploy.s.sol` | — | ✅ Sepolia 已部署 |
 | SDK | `sdk/src/StealthKey.ts` | 3 | ✅ 全绿 |
