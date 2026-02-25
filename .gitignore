@@ -1,6 +1,7 @@
 # Foundry build artifacts
 cache/
 out/
+broadcast/
 
 # Environment
 .env

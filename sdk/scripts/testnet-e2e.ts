@@ -41,8 +41,11 @@ const REPO_ROOT  = resolve(__dirname, '../../'); // sdk/scripts/ → stealth-pay
 
 // ─── !! 部署后请替换为真实地址 !! ──────────────────────────────────────────
 
-const VAULT_ADDRESS: Address = '0x0000000000000000000000000000000000000000'; // TODO: 填入 StealthPayVault 地址
-const USDT_ADDRESS:  Address = '0x0000000000000000000000000000000000000000'; // TODO: 填入 ERC20Mock 地址
+const VAULT_ADDRESS = process.env.VAULT_ADDRESS as Address | undefined;
+const USDT_ADDRESS  = process.env.USDT_ADDRESS  as Address | undefined;
+
+if (!VAULT_ADDRESS) throw new Error('Missing VAULT_ADDRESS in .env');
+if (!USDT_ADDRESS)  throw new Error('Missing USDT_ADDRESS in .env');
 
 // ─── ABI（forge build 后从 out/ 读取）──────────────────────────────────────
 
