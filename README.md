@@ -223,89 +223,158 @@ Assert: recipient +4950 USDT, relayer +50 USDT
 
 ## 六、快速开始
 
-### 合约
+> 本节按从零到可运行的顺序讲解。分为两条路径：
+> - **路径 A**：本地合约测试 + SDK 单元测试（无需 Sepolia，5 分钟内跑通）
+> - **路径 B**：Sepolia 测试网部署 → Demo 门户 / SDK 全链路（需要钱包和 RPC）
+
+---
+
+### 路径 A — 纯本地测试（无需钱包）
+
+**前置工具**
+- [Foundry](https://book.getfoundry.sh/getting-started/installation)（`curl -L https://foundry.paradigm.xyz | bash && foundryup`）
+- Node.js ≥ 20、Git
 
 ```bash
-# 依赖
+# 1. 拉取子模块依赖
 git submodule update --init --recursive
 
-# 编译
+# 2. 编译合约
 forge build
 
-# 全量测试（含 256 轮模糊测试）
+# 3. 运行合约测试（含 256 轮模糊测试）
 forge test -v
+
+# 4. SDK 单元测试（ECDH 推导，纯链下，无需节点）
+cd sdk && npm install && npm test
 ```
 
-### SDK
+Anvil（Foundry 内置本地节点）会在 E2E 测试中自动启动和关闭：
 
 ```bash
-cd sdk
-npm install
-npm test
+# 本地全链路 E2E（Anvil 自动管理）
+cd sdk && npm test test/e2e.integration.test.ts
 ```
 
-### 本地 E2E
+---
+
+### 路径 B — Sepolia 测试网（Demo 门户 / SDK 全链路）
+
+#### B-1. 准备账户和 RPC
+
+需要准备 **3 个账户**（可用 MetaMask 新建，导出私钥备用）：
+
+| 角色 | 用途 | 需要 Sepolia ETH |
+|------|------|-----------------|
+| Deployer | 部署合约、铸造测试 USDT | ✅ 约 0.05 ETH |
+| HR | 调用 `approve` + `depositForPayroll` | ✅ 约 0.02 ETH |
+| Relayer | 替员工代发 `claim` 交易 | ✅ 约 0.02 ETH |
+
+> **获取 Sepolia ETH（水龙头）**
+> - https://sepoliafaucet.com（需 Alchemy 账号）
+> - https://faucet.quicknode.com/ethereum/sepolia
+> - https://faucets.chain.link（需少量主网 ETH）
+
+获取 **Alchemy RPC URL**（免费）：
+1. 注册 [alchemy.com](https://alchemy.com) → 创建 App → 选择 Ethereum Sepolia
+2. 复制 HTTPS URL，格式为 `https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY`
+
+---
+
+#### B-2. 部署合约（一次性）
+
+在仓库根目录创建 `.env`：
 
 ```bash
-# Anvil 由测试自动启动
-cd sdk
-npm test test/e2e.integration.test.ts
+# .env（根目录，仅部署用，不要提交）
+DEPLOYER_PRIVATE_KEY=0x...   # Deployer 私钥
+SEPOLIA_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+ETHERSCAN_KEY=YOUR_KEY        # 可选，用于合约验证
 ```
 
-### Demo 门户（Next.js）
+```bash
+source .env
+
+forge script script/Deploy.s.sol:DeployScript \
+  --rpc-url $SEPOLIA_RPC_URL \
+  --private-key $DEPLOYER_PRIVATE_KEY \
+  --broadcast
+```
+
+部署完成后控制台输出两个地址，**记录下来**：
+
+```
+=== Deployment Complete ===
+ERC20Mock (USDT) : 0xAAAA...   ← USDT_ADDRESS
+StealthPayVault  : 0xBBBB...   ← VAULT_ADDRESS
+Deployer         : 0x...
+Minted 1,000,000 USDT to deployer.
+```
+
+> 部署成功后 Deployer 账户持有 1,000,000 测试 USDT，转部分到 HR 账户用于发薪。
+
+---
+
+#### B-3A. SDK 全链路脚本
+
+```bash
+# sdk/.env
+cat > sdk/.env <<EOF
+SEPOLIA_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+HR_PRIVATE_KEY=0x...          # HR 账户私钥（持有测试 USDT）
+RELAYER_PRIVATE_KEY=0x...     # Relayer 账户私钥（持有少量 ETH）
+VAULT_ADDRESS=0xBBBB...       # 部署步骤输出的 StealthPayVault 地址
+USDT_ADDRESS=0xAAAA...        # 部署步骤输出的 ERC20Mock 地址
+EOF
+
+cd sdk && npm run run:testnet
+```
+
+---
+
+#### B-3B. Demo 门户（Next.js 可视化）
 
 ```bash
 cd example
 
-# 安装依赖
 npm install
 
-# 配置环境变量
+# 从模板创建配置文件
 cp .env.local.example .env.local
-# 编辑 .env.local，填入合约地址、Alchemy RPC URL 和 Relayer 私钥
-
-# 启动开发服务器
-npm run dev
-# → http://localhost:3000
 ```
 
-**环境变量说明（`example/.env.local`）：**
+编辑 `example/.env.local`，填入以下参数：
 
-| 变量 | 说明 |
-|------|------|
-| `NEXT_PUBLIC_VAULT_ADDRESS` | 已部署的 StealthPayVault 地址 |
-| `NEXT_PUBLIC_USDT_ADDRESS` | Sepolia ERC20Mock（USDT）地址 |
-| `NEXT_PUBLIC_SEPOLIA_RPC_URL` | 浏览器端 Alchemy/Infura RPC |
-| `RELAYER_PRIVATE_KEY` | Relayer 私钥（服务端，持有少量 ETH 用于 Gas）|
-| `SEPOLIA_RPC_URL` | 服务端 Relayer 专用 RPC |
-
-**使用流程：**
-
-```
-1. 员工访问 /employee → 连接 MetaMask → 复制显示的 Meta 公钥
-2. HR 访问 /hr → 粘贴 Meta 公钥 + 输入金额 → 点击「执行发薪」
-3. 员工回到 /employee → 点击「一键提取全部」→ Relayer 代发 Gas
-```
-
-### Sepolia 测试网 E2E
+| 变量 | 填入内容 |
+|------|---------|
+| `NEXT_PUBLIC_VAULT_ADDRESS` | 部署步骤输出的 `StealthPayVault` 地址 |
+| `NEXT_PUBLIC_USDT_ADDRESS` | 部署步骤输出的 `ERC20Mock` 地址 |
+| `NEXT_PUBLIC_SEPOLIA_RPC_URL` | Alchemy HTTPS URL（浏览器端使用） |
+| `RELAYER_PRIVATE_KEY` | Relayer 账户私钥（服务端代发 Gas） |
+| `SEPOLIA_RPC_URL` | Alchemy HTTPS URL（服务端 Relayer 使用） |
 
 ```bash
-# 1. 部署合约（记录输出的两个地址）
-source .env && forge script script/Deploy.s.sol:DeployScript \
-  --rpc-url $SEPOLIA_RPC_URL --broadcast
-
-# 2. 创建 sdk/.env（HR 与 Relayer 使用独立私钥）
-cat > sdk/.env <<EOF
-SEPOLIA_RPC_URL="https://..."
-HR_PRIVATE_KEY="0x..."
-RELAYER_PRIVATE_KEY="0x..."
-VAULT_ADDRESS="0x..."   # 步骤 1 部署后打印的地址
-USDT_ADDRESS="0x..."    # 步骤 1 部署后打印的地址
-EOF
-
-# 3. 运行全链路脚本
-cd sdk && npm run run:testnet
+npm run dev
+# → 打开 http://localhost:3000
 ```
+
+**Demo 使用流程（需要 MetaMask）：**
+
+```
+① 员工端 /employee
+   → 连接 MetaMask（员工账户）→ 签名 → 复制蓝色框里的 Meta 公钥
+
+② HR 端 /hr
+   → 连接 MetaMask（HR 账户，需持有测试 USDT）
+   → 粘贴员工 Meta 公钥 → 输入金额 → 执行发薪
+   （自动完成 approve + depositForPayroll）
+
+③ 员工端 /employee
+   → 点击「一键提取全部」→ Relayer 代发 Gas，无需员工持有 ETH
+   → 点击「+ 添加 USDT 到 MetaMask」即可在钱包中看到余额
+```
+
+> **同一浏览器测试两个角色**：在 MetaMask 中切换 Account（HR 用 Account 1，员工用 Account 2），切换后点页面上的「切换」按钮重新连接即可。
 
 ---
 
