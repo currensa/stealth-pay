@@ -264,11 +264,12 @@ cd sdk && npm test test/e2e.integration.test.ts
 
 需要准备 **3 个账户**（可用 MetaMask 新建，导出私钥备用）：
 
-| 角色 | 用途 | 需要 Sepolia ETH |
-|------|------|-----------------|
-| Deployer | 部署合约、铸造测试 USDT | ✅ 约 0.05 ETH |
-| HR | 调用 `approve` + `depositForPayroll` | ✅ 约 0.02 ETH |
-| Relayer | 替员工代发 `claim` 交易 | ✅ 约 0.02 ETH |
+| 角色 | 用途 | 需要 Sepolia ETH | 需要测试 USDT |
+|------|------|-----------------|--------------|
+| Deployer | 部署合约、铸造测试 USDT | ✅ ≥ 0.1 ETH（水龙头获取）| 部署后自动持有 1,000,000 |
+| HR | 调用 `approve` + `depositForPayroll` | ✅ 约 0.02 ETH（水龙头）| 部署时填 `HR_ADDRESS` 自动 mint，或与 Deployer 共用同一账户 |
+| Relayer | 替员工代发 `claim` 交易，收手续费 | ✅ 约 0.05 ETH（部署时填 `RELAYER_ADDRESS` 自动转入）| ❌ 不需要 |
+| Employee | 签名提款（MetaMask 浏览器端）| ❌ 无需 ETH（Relayer 代发）| ❌ 不需要 |
 
 > **获取 Sepolia ETH（水龙头）**
 > - https://sepoliafaucet.com（需 Alchemy 账号）
@@ -281,15 +282,20 @@ cd sdk && npm test test/e2e.integration.test.ts
 
 ---
 
-#### B-2. 部署合约（一次性）
+#### B-2. 部署合约并完成充值（一次性）
 
-在仓库根目录创建 `.env`：
+在仓库根目录创建 `.env`（**不要提交此文件**）：
 
 ```bash
-# .env（根目录，仅部署用，不要提交）
-DEPLOYER_PRIVATE_KEY=0x...   # Deployer 私钥
+# .env（根目录）
+DEPLOYER_PRIVATE_KEY=0x...   # Deployer 私钥（需持有 ≥ 0.1 Sepolia ETH）
 SEPOLIA_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
-ETHERSCAN_KEY=YOUR_KEY        # 可选，用于合约验证
+
+# 可选：填入后部署脚本会自动完成充值，省去手动转账
+HR_ADDRESS=0x...             # HR 钱包地址（将收到 100,000 测试 USDT）
+RELAYER_ADDRESS=0x...        # Relayer 钱包地址（将收到 0.05 Sepolia ETH 做 Gas）
+
+ETHERSCAN_KEY=YOUR_KEY       # 可选，用于合约验证
 ```
 
 ```bash
@@ -301,17 +307,19 @@ forge script script/Deploy.s.sol:DeployScript \
   --broadcast
 ```
 
-部署完成后控制台输出两个地址，**记录下来**：
+部署完成后控制台输出以下信息，**记录两个合约地址**：
 
 ```
 === Deployment Complete ===
-ERC20Mock (USDT) : 0xAAAA...   ← USDT_ADDRESS
-StealthPayVault  : 0xBBBB...   ← VAULT_ADDRESS
+ERC20Mock (USDT) : 0xAAAA...   ← 记为 USDT_ADDRESS
+StealthPayVault  : 0xBBBB...   ← 记为 VAULT_ADDRESS
 Deployer         : 0x...
 Minted 1,000,000 USDT to deployer.
+Minted 100,000 USDT to HR     : 0x...   ← 填了 HR_ADDRESS 才有此行
+Sent 0.05 ETH to Relayer      : 0x...   ← 填了 RELAYER_ADDRESS 才有此行
 ```
 
-> 部署成功后 Deployer 账户持有 1,000,000 测试 USDT，转部分到 HR 账户用于发薪。
+> **不想分离角色？** 测试时可以让 Deployer 和 HR 使用同一个私钥，USDT 已经在 Deployer 账户里，无需任何额外操作。Relayer 需要单独账户（员工签名后由它代发交易）。
 
 ---
 
