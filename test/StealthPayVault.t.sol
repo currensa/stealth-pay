@@ -321,6 +321,78 @@ contract StealthPayVaultTest is Test {
         assertEq(usdc.balanceOf(recipientB), amountB, "B should receive USDC");
     }
 
+    /// @notice 员工一次性批量提取两个月薪水（batchClaim）
+    function test_BatchClaim_Success() public {
+        // ── 两个月份各一把影子私钥 ────────────────────────────────────────────
+        uint256 stealthPk1   = 0xC0FFEE01;
+        address stealthAddr1 = vm.addr(stealthPk1);
+        uint256 stealthPk2   = 0xC0FFEE02;
+        address stealthAddr2 = vm.addr(stealthPk2);
+
+        uint256 salary1 = 1_000 ether;
+        uint256 salary2 = 1_200 ether;
+        uint256 fee     =    10 ether;
+
+        // ── 各自单叶 Merkle 树（leaf == root） ────────────────────────────────
+        bytes32 rootA = _leaf(stealthAddr1, address(usdt), salary1);
+        bytes32 rootB = _leaf(stealthAddr2, address(usdt), salary2);
+        bytes32[] memory emptyProof = new bytes32[](0);
+
+        // ── HR 分两期存款 ─────────────────────────────────────────────────────
+        _depositUSDT(rootA, salary1);
+        _depositUSDT(rootB, salary2);
+
+        // ── 构造两笔 ClaimRequest ─────────────────────────────────────────────
+        StealthPayVault.ClaimRequest memory req1 = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddr1,
+            token:          address(usdt),
+            amount:         salary1,
+            recipient:      employeeDest,
+            feeAmount:      fee,
+            deadline:       block.timestamp + 1 hours
+        });
+        StealthPayVault.ClaimRequest memory req2 = StealthPayVault.ClaimRequest({
+            stealthAddress: stealthAddr2,
+            token:          address(usdt),
+            amount:         salary2,
+            recipient:      employeeDest,
+            feeAmount:      fee,
+            deadline:       block.timestamp + 1 hours
+        });
+
+        // ── 员工分别对两笔请求签名 ─────────────────────────────────────────────
+        bytes memory sig1 = _signClaimRequest(req1, stealthPk1);
+        bytes memory sig2 = _signClaimRequest(req2, stealthPk2);
+
+        // ── 组装数组 ──────────────────────────────────────────────────────────
+        StealthPayVault.ClaimRequest[] memory reqs = new StealthPayVault.ClaimRequest[](2);
+        reqs[0] = req1;
+        reqs[1] = req2;
+
+        bytes[] memory sigs = new bytes[](2);
+        sigs[0] = sig1;
+        sigs[1] = sig2;
+
+        bytes32[][] memory proofs = new bytes32[][](2);
+        proofs[0] = emptyProof;
+        proofs[1] = emptyProof;
+
+        bytes32[] memory roots = new bytes32[](2);
+        roots[0] = rootA;
+        roots[1] = rootB;
+
+        // ── Relayer 一次性批量提交 ─────────────────────────────────────────────
+        vm.prank(relayerNode);
+        vault.batchClaim(reqs, sigs, proofs, roots);
+
+        // ── 断言 ──────────────────────────────────────────────────────────────
+        uint256 expectedNet = (salary1 - fee) + (salary2 - fee);
+        assertEq(usdt.balanceOf(employeeDest), expectedNet,  "employee should receive combined salary");
+        assertEq(usdt.balanceOf(relayerNode),  2 * fee,      "relayer should receive 2x fee");
+        assertTrue(vault.isClaimed(stealthAddr1),            "month1 stealth should be claimed");
+        assertTrue(vault.isClaimed(stealthAddr2),            "month2 stealth should be claimed");
+    }
+
     /// @notice 拿 USDT root 的 Proof 却请求提取 USDC → TokenMismatch
     function test_RevertIf_CrossTenantTokenAttack() public {
         address hrA = makeAddr("hrA");

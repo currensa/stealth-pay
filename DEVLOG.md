@@ -875,3 +875,67 @@ Ran 13 tests for test/StealthPayVault.t.sol:StealthPayVaultTest
 | SDK | `sdk/src/StealthKey.ts` | 3 | ✅ 全绿 |
 | 本地 E2E | `sdk/test/e2e.integration.test.ts` | 1 | ✅ 全绿（Anvil） |
 | 测试网脚本 | `sdk/scripts/testnet-e2e.ts` | — | ✅ Sepolia 全链路验证通过 |
+
+---
+
+## 阶段 16：Next.js 可视化演示门户（example/）
+
+### 目标
+创建独立子目录 `example/`，提供浏览器可视化演示，让 HR 和员工通过 UI 与 Sepolia 上的
+StealthPayVault 合约交互。
+
+### 关键技术决策
+| 问题 | 决策 | 原因 |
+|------|------|------|
+| SDK 导入 | 复制 `StealthKey.ts` 到 `example/src/lib/` | 父 SDK 是 ESM-only，Next.js 有 CJS/ESM 混合问题 |
+| Merkle Tree | 浏览器端 viem 手算单叶 | `@openzeppelin/merkle-tree` 依赖 Node.js crypto，不支持浏览器 |
+| Mock DB | `src/lib/db.ts` 内存数组 + db.json 文件持久化 | 最简单，无外部依赖 |
+| 钱包连接 | viem `custom(window.ethereum)` | 无需额外库 |
+| 员工身份 | `personal_sign` 签名哈希作为 metaPrivKey | 确定性推导，不用管理密钥 |
+| 脚手架 | 手动创建文件（无 npx/npm） | 本机未安装 Node.js |
+
+### 文件结构
+```
+example/
+├── .env.local.example        — 环境变量模板
+├── package.json              — next@15, viem, @noble/curves, @noble/hashes
+├── src/
+│   ├── app/
+│   │   ├── layout.tsx        — Root layout（Tailwind 深色主题）
+│   │   ├── page.tsx          — 首页：HR / Employee 两大入口
+│   │   ├── hr/page.tsx       — HR 控制台（approve + depositForPayroll）
+│   │   ├── employee/page.tsx — 员工提取端（scan + signTypedData + relayer）
+│   │   └── api/
+│   │       ├── db/route.ts       — GET/POST/PATCH mock DB API
+│   │       └── relayer/route.ts  — POST → Sepolia claim tx
+│   └── lib/
+│       ├── stealthKey.ts     — 从父 SDK 复制（纯 ES 密码学）
+│       ├── merkle.ts         — 浏览器兼容单叶 Merkle helper
+│       ├── vaultAbi.ts       — 合约 ABI + ERC20 ABI 常量
+│       ├── constants.ts      — 合约地址、链配置
+│       └── db.ts             — 共享 in-memory + db.json DB 工具
+└── db.json                   — 运行时写入，已加入 .gitignore
+```
+
+### HR 流程
+1. 连接 MetaMask（Sepolia）
+2. 生成随机 ephemeralPrivKey（32 字节）
+3. 推导 ephemeralPublicKey 和 stealthAddress（ECDH）
+4. 计算单叶 Merkle root
+5. `USDT.approve(vault, amount)` → 等 receipt
+6. `vault.depositForPayroll(root, USDT, amount)` → 等 receipt
+7. POST `/api/db` 存储记录
+
+### 员工流程
+1. 连接 MetaMask
+2. `personal_sign("StealthPay Identity v1")` → `metaPrivKey = keccak256(sig)`
+3. `metaPubKey = getMetaPublicKey(metaPrivKey)` → 显示供 HR 使用
+4. GET `/api/db?metaPubKey=` → 待提取记录列表
+5. 对每条：ECDH 恢复 stealthPrivKey
+6. `privateKeyToAccount(stealthPrivKey).signTypedData(ClaimRequest)` — 无 Gas
+7. POST `/api/relayer` → Relayer 代发 `vault.claim()`
+
+### 结果
+- 所有文件已创建，结构完整
+- 需运行 `cd example && npm install` 安装依赖后 `npm run dev`
+- 配置 `.env.local` 后可在 http://localhost:3000 演示完整流程

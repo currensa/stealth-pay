@@ -51,6 +51,9 @@ contract StealthPayVault is ReentrancyGuard {
     /// @notice 原生 ETH 转账（call）失败
     error EthTransferFailed();
 
+    /// @notice batchClaim 四个入参数组长度不一致
+    error ArrayLengthMismatch();
+
     // -------------------------------------------------------------------------
     // 结构体
     // -------------------------------------------------------------------------
@@ -190,6 +193,43 @@ contract StealthPayVault is ReentrancyGuard {
         bytes32[] calldata merkleProof,
         bytes32 root
     ) external nonReentrant {
+        _processClaim(req, signature, merkleProof, root);
+    }
+
+    /// @notice 批量提款：Relayer 一次提交多笔 Claim，节省 Gas
+    /// @dev    四个数组长度必须相等；每笔复用 _processClaim 完整验证逻辑；
+    ///         整体受 nonReentrant 保护，循环内转账均在同一锁内执行。
+    /// @param reqs       提款请求数组
+    /// @param signatures 对应各请求的 EIP-712 签名数组
+    /// @param proofs     对应各请求的 Merkle Proof 数组
+    /// @param roots      对应各请求的 Merkle Root 数组
+    function batchClaim(
+        ClaimRequest[] calldata reqs,
+        bytes[] calldata signatures,
+        bytes32[][] calldata proofs,
+        bytes32[] calldata roots
+    ) external nonReentrant {
+        uint256 n = reqs.length;
+        if (n != signatures.length || n != proofs.length || n != roots.length)
+            revert ArrayLengthMismatch();
+
+        for (uint256 i = 0; i < n; ++i) {
+            _processClaim(reqs[i], signatures[i], proofs[i], roots[i]);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 内部函数
+    // -------------------------------------------------------------------------
+
+    /// @dev 单笔提款核心逻辑（由 claim 与 batchClaim 共享）
+    ///      调用方必须持有 nonReentrant 锁。
+    function _processClaim(
+        ClaimRequest calldata req,
+        bytes calldata signature,
+        bytes32[] calldata merkleProof,
+        bytes32 root
+    ) internal {
         address stealth = req.stealthAddress;
 
         // 1. 时效检查

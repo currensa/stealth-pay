@@ -86,11 +86,24 @@ stealth-pay/
 │   └── test/
 │       ├── StealthKey.test.ts       # SDK 单元测试
 │       └── e2e.integration.test.ts  # 全链路 E2E 测试（Anvil）
+├── example/                         # Next.js 可视化演示门户（HR + 员工 UI）
+│   ├── src/app/
+│   │   ├── hr/page.tsx              # HR 控制台（approve + depositForPayroll）
+│   │   ├── employee/page.tsx        # 员工提取端（scan + signTypedData + relayer）
+│   │   └── api/
+│   │       ├── db/route.ts          # Mock DB API（GET/POST/PATCH）
+│   │       └── relayer/route.ts     # Relayer API（POST → Sepolia claim）
+│   └── src/lib/
+│       ├── stealthKey.ts            # ECDH SDK（从父 SDK 复制，浏览器兼容）
+│       ├── merkle.ts                # 单叶 Merkle root（无 OZ 依赖）
+│       ├── vaultAbi.ts              # 合约 ABI 常量
+│       ├── constants.ts             # 合约地址、链配置
+│       └── db.ts                    # 共享内存 + db.json 持久化
 ├── lib/
 │   ├── forge-std/
 │   └── openzeppelin-contracts/
 ├── foundry.toml
-└── DEVLOG.md                        # 完整开发日志（13 个阶段）
+└── DEVLOG.md                        # 完整开发日志（16 个阶段）
 ```
 
 ---
@@ -239,6 +252,41 @@ cd sdk
 npm test test/e2e.integration.test.ts
 ```
 
+### Demo 门户（Next.js）
+
+```bash
+cd example
+
+# 安装依赖
+npm install
+
+# 配置环境变量
+cp .env.local.example .env.local
+# 编辑 .env.local，填入合约地址、Alchemy RPC URL 和 Relayer 私钥
+
+# 启动开发服务器
+npm run dev
+# → http://localhost:3000
+```
+
+**环境变量说明（`example/.env.local`）：**
+
+| 变量 | 说明 |
+|------|------|
+| `NEXT_PUBLIC_VAULT_ADDRESS` | 已部署的 StealthPayVault 地址 |
+| `NEXT_PUBLIC_USDT_ADDRESS` | Sepolia ERC20Mock（USDT）地址 |
+| `NEXT_PUBLIC_SEPOLIA_RPC_URL` | 浏览器端 Alchemy/Infura RPC |
+| `RELAYER_PRIVATE_KEY` | Relayer 私钥（服务端，持有少量 ETH 用于 Gas）|
+| `SEPOLIA_RPC_URL` | 服务端 Relayer 专用 RPC |
+
+**使用流程：**
+
+```
+1. 员工访问 /employee → 连接 MetaMask → 复制显示的 Meta 公钥
+2. HR 访问 /hr → 粘贴 Meta 公钥 + 输入金额 → 点击「执行发薪」
+3. 员工回到 /employee → 点击「一键提取全部」→ Relayer 代发 Gas
+```
+
 ### Sepolia 测试网 E2E
 
 ```bash
@@ -354,4 +402,4 @@ Minted 1,000,000 USDT to deployer.
 
 ---
 
-> 完整开发过程（16 个阶段）详见 [DEVLOG.md](./DEVLOG.md)。
+> 完整开发过程（16 个阶段，含 Next.js 门户）详见 [DEVLOG.md](./DEVLOG.md)。
