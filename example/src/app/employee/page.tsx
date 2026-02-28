@@ -5,6 +5,8 @@ import Link from 'next/link';
 import {
   keccak256,
   toBytes,
+  toHex,
+  formatUnits,
   type Hex,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
@@ -51,7 +53,8 @@ const CLAIM_TYPES = {
 async function deriveMetaPrivKey(addr: Hex): Promise<Hex> {
   const sig: Hex = await window.ethereum.request({
     method: 'personal_sign',
-    params: ['StealthPay Identity v1', addr],
+    // hex-encode the message so all wallets (MetaMask, OKX, etc.) accept it
+    params: [toHex('StealthPay Identity v1'), addr],
   });
   return keccak256(toBytes(sig));
 }
@@ -81,9 +84,10 @@ export default function EmployeePage() {
       // 检查网络
       const chainIdHex: string = await window.ethereum.request({ method: 'eth_chainId' });
       if (parseInt(chainIdHex, 16) !== SEPOLIA_CHAIN_ID) {
-        setErrorMsg(`请切换到 Sepolia 测试网（chain ID ${SEPOLIA_CHAIN_ID}）`);
-        setPageStatus('error');
-        return;
+        await window.ethereum.request({
+          method: 'wallet_switchEthereumChain',
+          params: [{ chainId: `0x${SEPOLIA_CHAIN_ID.toString(16)}` }],
+        });
       }
 
       // 2. 签名 → 确定性 metaPrivKey
@@ -224,9 +228,29 @@ export default function EmployeePage() {
       ) : (
         <div className="space-y-6">
           {/* Account */}
-          <div className="rounded-xl border border-gray-800 bg-gray-900 px-5 py-4">
-            <p className="text-xs text-gray-500">当前账户</p>
-            <p className="mt-1 break-all font-mono text-sm text-gray-200">{account}</p>
+          <div className="flex items-center justify-between rounded-xl border border-gray-800 bg-gray-900 px-5 py-4">
+            <div>
+              <p className="text-xs text-gray-500">当前账户</p>
+              <p className="mt-1 break-all font-mono text-sm text-gray-200">{account}</p>
+            </div>
+            <button
+              onClick={async () => {
+                await window.ethereum.request({
+                  method: 'wallet_watchAsset',
+                  params: {
+                    type: 'ERC20',
+                    options: {
+                      address: process.env.NEXT_PUBLIC_USDT_ADDRESS,
+                      symbol: 'USDT',
+                      decimals: 18,
+                    },
+                  },
+                });
+              }}
+              className="ml-4 shrink-0 rounded-lg border border-yellow-700 bg-yellow-900/30 px-3 py-1.5 text-xs text-yellow-300 transition hover:bg-yellow-800/50"
+            >
+              + 添加 USDT 到 MetaMask
+            </button>
           </div>
 
           {/* Meta public key — share with HR */}
@@ -273,7 +297,7 @@ export default function EmployeePage() {
                       <div className="min-w-0 flex-1">
                         <p className="text-sm text-gray-400">金额</p>
                         <p className="text-lg font-semibold text-white">
-                          {(Number(record.amount) / 1e6).toFixed(2)} USDT
+                          {Number(formatUnits(BigInt(record.amount), 18)).toFixed(2)} USDT
                         </p>
                         <p className="mt-2 break-all font-mono text-xs text-gray-600">
                           Stealth: {record.stealthAddress}
